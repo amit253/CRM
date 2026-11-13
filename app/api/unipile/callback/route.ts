@@ -7,7 +7,7 @@ function homeRedirect(
   options: { provider?: string; clearState?: boolean } = {},
 ) {
   const origin = new URL(process.env.APP_URL || request.url).origin;
-  const url = new URL("/", origin);
+  const url = new URL("/inbox", origin);
   url.searchParams.set("connection", result);
   if (options.provider) {
     url.searchParams.set("provider", options.provider);

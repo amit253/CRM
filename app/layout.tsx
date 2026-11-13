@@ -2,8 +2,8 @@ import type { Metadata } from "next";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Phigrad — Communication workspace",
-  description: "A unified workspace for customer conversations and connected accounts.",
+  title: "Phigrad CRM — Business relationships, clearly organized",
+  description: "A local-first CRM for business relationships, opportunities, follow-ups, and conversations.",
 };
 
 export default function RootLayout({

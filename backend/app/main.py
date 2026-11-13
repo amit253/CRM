@@ -16,6 +16,8 @@ from starlette.background import BackgroundTask
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(PROJECT_ROOT / ".env")
 
+from app.crm import initialize_database, router as crm_router
+
 LOCAL_HOSTS = {"localhost:8001", "127.0.0.1:8001"}
 LOCAL_ORIGINS = {
     "http://localhost:3000",
@@ -61,6 +63,7 @@ def unipile_base_url() -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    initialize_database()
     async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as client:
         app.state.unipile_client = client
         yield
@@ -75,6 +78,7 @@ app = FastAPI(
     version="0.1.0",
     lifespan=lifespan,
 )
+app.include_router(crm_router)
 
 
 @app.middleware("http")
@@ -118,6 +122,9 @@ async def health():
         "status": "ok",
         "unipile_api_key_configured": bool(
             os.getenv("UNIPILE_API_KEY") or os.getenv("Unipile_Api_Key")
+        ),
+        "openrouter_api_key_configured": bool(
+            os.getenv("OPENROUTER_API_KEY") or os.getenv("Open_Router_Api_Key")
         ),
     }
 

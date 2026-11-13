@@ -39,29 +39,29 @@ export async function forwardToFastApi(
 ): Promise<Response> {
   const { token, baseUrl } = getBridgeConfig();
   const normalizedPath = path.startsWith("/") ? path : `/${path}`;
-  const [apiVersion, ...segments] = normalizedPath.slice(1).split("/");
+  const [namespace, ...segments] = normalizedPath.slice(1).split("/");
   if (
-    !["v1", "v2"].includes(apiVersion) ||
+    !["v1", "v2", "crm"].includes(namespace) ||
     segments.length === 0 ||
     segments.some((segment) => segment === "." || segment === "..") ||
-    normalizedPath.includes("\\")
+    normalizedPath.includes("\\") ||
+    /[\u0000-\u001f]/.test(normalizedPath)
   ) {
-    throw new FastApiBridgeError("Unsupported Unipile endpoint path.", 400);
+    throw new FastApiBridgeError("Unsupported FastAPI endpoint path.", 400);
   }
 
   try {
+    const headers = new Headers(init.headers);
+    headers.set("Authorization", `Bearer ${token}`);
     return await fetch(`${baseUrl}${normalizedPath}`, {
       ...init,
-      headers: {
-        ...(init.headers ?? {}),
-        Authorization: `Bearer ${token}`,
-      },
+      headers,
       cache: "no-store",
       signal: AbortSignal.timeout(35_000),
     });
   } catch {
     throw new FastApiBridgeError(
-      "FastAPI is not running. Start the backend on http://127.0.0.1:8000.",
+      "FastAPI is not running. Start the backend on http://127.0.0.1:8001.",
       502,
     );
   }

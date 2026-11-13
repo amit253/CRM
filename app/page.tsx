@@ -1,25 +1,12 @@
-import UnifiedInbox from "@/components/unified-inbox";
+import CRMWorkspace from "@/components/crm-workspace";
+import { isOpenRouterConfigured } from "@/lib/openrouter-config";
 import { isUnipileConfigured } from "@/lib/unipile";
 
-type HomePageProps = {
-  searchParams: Promise<{
-    connection?: string;
-    provider?: string;
-  }>;
-};
-
-export default async function HomePage({ searchParams }: HomePageProps) {
-  const params = await searchParams;
-  const connection =
-    params.connection === "success" || params.connection === "failed"
-      ? params.connection
-      : null;
-
+export default function HomePage() {
   return (
-    <UnifiedInbox
-      apiConfigured={isUnipileConfigured()}
-      connection={connection}
-      provider={params.provider ?? null}
+    <CRMWorkspace
+      aiConfigured={isOpenRouterConfigured()}
+      unipileConfigured={isUnipileConfigured()}
     />
   );
 }
