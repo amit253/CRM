@@ -6,6 +6,7 @@ type InboxPageProps = {
   searchParams: Promise<{
     connection?: string;
     provider?: string;
+    reason?: string;
   }>;
 };
 
@@ -22,6 +23,7 @@ export default async function InboxPage({ searchParams }: InboxPageProps) {
       aiConfigured={isOpenRouterConfigured()}
       connection={connection}
       provider={params.provider ?? null}
+      reason={params.reason ?? null}
     />
   );
 }

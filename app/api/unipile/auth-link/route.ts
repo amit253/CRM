@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
-import { cookies } from "next/headers";
 import { NextRequest, NextResponse } from "next/server";
+import { acceptedBrowserOrigin } from "@/lib/app-origin";
+import { cookieSecure } from "@/lib/auth-session";
 import { FastApiBridgeError, forwardToFastApi } from "@/lib/fastapi-bridge";
 
 const allowedProviders = new Set([
@@ -15,15 +16,8 @@ const allowedProviders = new Set([
 ]);
 
 export async function POST(request: NextRequest) {
-  const expectedOrigin = new URL(process.env.APP_URL || request.url).origin;
-  const requestOrigin = request.headers.get("origin");
-  let originMatches = false;
-  try {
-    originMatches = Boolean(requestOrigin && new URL(requestOrigin).origin === expectedOrigin);
-  } catch {
-    originMatches = false;
-  }
-  if (!originMatches) {
+  const origin = acceptedBrowserOrigin(request.headers.get("origin"), request.headers.get("host"));
+  if (!origin) {
     return NextResponse.json({ error: "Request origin was not accepted." }, { status: 403 });
   }
 
@@ -42,11 +36,11 @@ export async function POST(request: NextRequest) {
     return NextResponse.json({ error: "Choose a supported provider." }, { status: 400 });
   }
 
-  const state = randomBytes(32).toString("base64url");
-  const origin = new URL(process.env.APP_URL || request.url).origin;
+  const statePrefix = origin === "http://127.0.0.1:3000" ? "ip" : origin === "http://localhost:3000" ? "lh" : "app";
+  const state = `${statePrefix}.${randomBytes(32).toString("base64url")}`;
 
   try {
-    const response = await forwardToFastApi("/v2/auth/link", {
+    const upstream = await forwardToFastApi("/v2/auth/link", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -56,15 +50,15 @@ export async function POST(request: NextRequest) {
         state,
       }),
     });
-    if (!response.ok) {
-      console.error(`FastAPI Unipile auth-link request failed with status ${response.status}.`);
+    if (!upstream.ok) {
+      console.error(`FastAPI Unipile auth-link request failed with status ${upstream.status}.`);
       return NextResponse.json(
         { error: "Could not start account connection. Check the FastAPI and Unipile settings." },
         { status: 502 },
       );
     }
 
-    const result: unknown = await response.json();
+    const result: unknown = await upstream.json();
     const link =
       typeof result === "object" && result !== null && "link" in result
         ? result.link
@@ -77,19 +71,21 @@ export async function POST(request: NextRequest) {
       throw new Error("Unipile returned an insecure authentication link.");
     }
 
-    const cookieStore = await cookies();
-    cookieStore.set("unipile_auth_state", state, {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: process.env.NODE_ENV === "production",
-      path: "/api/unipile/callback",
-      maxAge: 10 * 60,
-    });
-
-    return NextResponse.json(
+    const response = NextResponse.json(
       { url: authUrl.toString() },
       { headers: { "Cache-Control": "no-store" } },
     );
+    const cookieOptions = {
+      httpOnly: true,
+      sameSite: "lax" as const,
+      secure: cookieSecure(),
+      path: "/",
+      maxAge: 10 * 60,
+    };
+    response.cookies.set("unipile_auth_state", "", { ...cookieOptions, path: "/api/unipile/callback", maxAge: 0 });
+    response.cookies.set("unipile_auth_state", state, cookieOptions);
+    response.cookies.set("unipile_return_origin", origin, cookieOptions);
+    return response;
   } catch (error) {
     if (error instanceof FastApiBridgeError) {
       return NextResponse.json(

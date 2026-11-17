@@ -1,41 +1,79 @@
 import { NextRequest, NextResponse } from "next/server";
+import { appOrigin, configuredAppOrigin } from "@/lib/app-origin";
+import { cookieSecure } from "@/lib/auth-session";
 import { FastApiBridgeError, forwardToFastApi } from "@/lib/fastapi-bridge";
+
+function startedOrigin(state: string) {
+  if (state.startsWith("ip.")) return "http://127.0.0.1:3000";
+  if (state.startsWith("lh.")) return "http://localhost:3000";
+  if (state.startsWith("app.")) return configuredAppOrigin();
+  return "";
+}
 
 function homeRedirect(
   request: NextRequest,
   result: "success" | "failed",
-  options: { provider?: string; clearState?: boolean } = {},
+  options: { provider?: string; clearState?: boolean; reason?: string } = {},
 ) {
-  const origin = new URL(process.env.APP_URL || request.url).origin;
+  const origin = appOrigin(request.cookies.get("unipile_return_origin")?.value || "")
+    || appOrigin(`http://${request.headers.get("host") || ""}`)
+    || appOrigin(`https://${request.headers.get("host") || ""}`)
+    || configuredAppOrigin()
+    || new URL(request.url).origin;
   const url = new URL("/inbox", origin);
   url.searchParams.set("connection", result);
   if (options.provider) {
     url.searchParams.set("provider", options.provider);
   }
+  if (options.reason) {
+    url.searchParams.set("reason", options.reason);
+  }
 
   const response = NextResponse.redirect(url);
-  if (options.clearState) {
-    response.cookies.set("unipile_auth_state", "", {
-      httpOnly: true,
-      sameSite: "lax",
-      secure: process.env.NODE_ENV === "production",
-      path: "/api/unipile/callback",
-      maxAge: 0,
-    });
-  }
+  response.cookies.set("unipile_return_origin", "", {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: cookieSecure(),
+    path: "/",
+    maxAge: 0,
+  });
+  response.cookies.set("unipile_auth_state", "", {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: cookieSecure(),
+    path: "/",
+    maxAge: 0,
+  });
+  response.cookies.set("unipile_auth_state", "", {
+    httpOnly: true,
+    sameSite: "lax",
+    secure: cookieSecure(),
+    path: "/api/unipile/callback",
+    maxAge: 0,
+  });
   response.headers.set("Cache-Control", "no-store");
   return response;
 }
 
 export async function GET(request: NextRequest) {
   const params = request.nextUrl.searchParams;
+  const receivedState = params.get("state") || "";
+  const started = startedOrigin(receivedState);
+  const here = appOrigin(`http://${request.headers.get("host") || ""}`)
+    || appOrigin(`https://${request.headers.get("host") || ""}`)
+    || appOrigin(request.url);
+  if (started && here && started !== here) {
+    const target = new URL("/api/unipile/callback", started);
+    params.forEach((value, key) => target.searchParams.append(key, value));
+    return NextResponse.redirect(target);
+  }
+
   const expectedState = request.cookies.get("unipile_auth_state")?.value;
-  const receivedState = params.get("state");
   if (!expectedState || !receivedState || expectedState !== receivedState) {
-    return homeRedirect(request, "failed");
+    return homeRedirect(request, "failed", { reason: "state" });
   }
   if (params.has("error_type")) {
-    return homeRedirect(request, "failed", { clearState: true });
+    return homeRedirect(request, "failed", { clearState: true, reason: "provider" });
   }
 
   const accountId = params.get("account_id");
@@ -46,6 +84,8 @@ export async function GET(request: NextRequest) {
   try {
     const accountResponse = await forwardToFastApi(
       `/v2/accounts/${encodeURIComponent(accountId)}`,
+      { method: "GET" },
+      { claimAccount: true },
     );
     if (!accountResponse.ok) {
       console.error(`FastAPI account verification failed with status ${accountResponse.status}.`);
@@ -60,6 +100,19 @@ export async function GET(request: NextRequest) {
     if (!accountRecord || !("id" in accountRecord) || accountRecord.id !== accountId) {
       console.error("Unipile callback account verification returned an unexpected account.");
       return homeRedirect(request, "failed", { clearState: true });
+    }
+
+    const registered = await forwardToFastApi("/crm/unipile-accounts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ account_id: accountId }),
+    });
+    if (!registered.ok) {
+      console.error(`Workspace account registration failed with status ${registered.status}.`);
+      return homeRedirect(request, "failed", {
+        clearState: true,
+        reason: registered.status === 409 ? "already-connected" : "register",
+      });
     }
 
     return homeRedirect(request, "success", {

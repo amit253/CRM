@@ -1,6 +1,6 @@
 # Phigrad CRM and communications workspace
 
-A local-first CRM with contacts, companies, a deal pipeline, follow-up tasks, private notes, a Unipile unified inbox, and OpenRouter-powered business-message classification.
+A local-first CRM with contacts, companies, a sales pipeline, follow-up tasks, private notes, a Unipile unified inbox, and OpenRouter-powered business-message classification.
 
 ## Run locally
 
@@ -27,10 +27,10 @@ The Next.js server forwards app requests to FastAPI. FastAPI injects the Unipile
 
 ## CRM features
 
-- **Overview:** contact/company counts, open-deal count, upcoming follow-ups, recent contacts.
-- **Contacts:** create and edit business contacts, associate a company, maintain status/source, add private notes, and review linked deals and tasks.
+- **Overview:** contact/company counts, open sales count, upcoming follow-ups, recent contacts, and sales counts by stage without currency amounts.
+- **Contacts:** create and edit business contacts, associate a company, maintain status/source, add private notes, and review linked sales and tasks.
 - **Companies:** maintain company profiles and see related contact and open-deal counts.
-- **Deals:** track opportunities across New, Qualified, Proposal, Won, and Lost stages, with values, close dates, contacts, and companies.
+- **Sales:** track opportunities across New, Qualified, Proposal, Won, and Lost stages, with close dates, contacts, and companies. Currency amounts are not shown or edited in the sales pipeline.
 - **Tasks:** create and complete follow-ups linked to a contact and/or deal.
 - **AI conversation assistant:** open **AI assistant** from the CRM sidebar or from a contact profile. A contact profile shows saved conversation history above the assistant; choose **Draft a follow-up**, **Quick summary**, or **What may be blocking the deal?** to load that history and focus the analysis. Linked deal and open-task details are also included as context. Review the text and explicitly confirm sharing before submitting it to OpenRouter. Results include business relevance, opportunity signal, summary, next step, and reply draft. The suggested next step can be saved as a linked task; reply drafts are never sent automatically.
 - **Unified inbox:** `/inbox` reads supported email/chat data from connected Unipile accounts, labels conversations by provider, and checks for new messages about once a minute while the page is open. Newly observed inbound messages are classified by Anand-specific lead rules using OpenRouter; available chat history is included as context. A message classified as a lead at 40% confidence or higher is automatically sent for a second extraction request using the conversation and available sender metadata. Lead status and extracted details are shown in the inbox. Older conversations are classified only when requested, and extraction remains part of the manual **Add to CRM** flow. Before saving, users can check the edited email or phone against CRM contacts. Matching is case-insensitive for email and ignores phone formatting; a match blocks creating a contact, company, or lead note.
@@ -38,13 +38,26 @@ The Next.js server forwards app requests to FastAPI. FastAPI injects the Unipile
 
 CRM records are persisted in `data/phigrad-crm.sqlite3`, which is ignored by Git. Back up this file if you need to preserve local CRM data.
 
-The overview numbers are calculated from this local CRM database: **Contacts** counts non-archived contact rows; **Companies** counts company rows; **Open pipeline** counts deals not in Won or Lost; **Follow-ups** counts incomplete tasks, with the smaller number counting incomplete tasks whose due date is today or earlier. Stage totals include all deals in each stage. These figures do not read Gmail, Unipile conversations, or inbox messages.
+The overview numbers are calculated from this local CRM database: **Contacts** counts non-archived contact rows; **Companies** counts company rows; **Open sales pipeline** counts sales not in Won or Lost; **Follow-ups** counts incomplete tasks, with the smaller number counting incomplete tasks whose due date is today or earlier. Stage totals include the number of sales in each stage, not their currency values. These figures do not read Gmail, Unipile conversations, or inbox messages.
+
+## Deploy with Docker
+
+The production image runs Next.js on port `$PORT` and FastAPI only on `127.0.0.1:8001` inside the same container. The browser never calls FastAPI directly. SQLite is stored at `/app/data/phigrad-crm.sqlite3`.
+
+```powershell
+docker build -t phigrad .
+docker run --rm -p 3000:3000 --env-file .env -e PHIGRAD_ENV=production -e NODE_ENV=production -e APP_URL=http://127.0.0.1:3000 -v phigrad-data:/app/data phigrad
+```
+
+Do not commit `.env`. For a new empty database, set `SUPERADMIN_EMAIL` and `SUPERADMIN_INITIAL_PASSWORD`, sign in once, then remove the initial password. Set `APP_URL` to the public `https` origin and register `https://<your-host>/api/unipile/callback` with Unipile.
+
+Render can use `render.yaml`. Connect the GitHub repository, fill the secret environment variables, and attach the `/app/data` disk. Without that disk, a redeploy starts from an empty database. Lovable is a hosted app builder and is not the runtime for this Next.js and FastAPI image.
 
 ## Important boundaries
 
-- This is a single local workspace, not a customer-ready multi-tenant SaaS CRM. There is no customer authentication, tenant isolation, hosted database, collaboration, or automated Unipile synchronization.
-- CRM contacts, companies, deals, tasks, notes, dashboard counts, and demo records come from the local SQLite database. Connecting Gmail or another Unipile account does not import it into CRM; the inbox and CRM are separate.
-- The app does not automatically import messages into CRM records. Classification and extraction do not create CRM records. Use **Add to CRM** on a conversation classified as a lead to review and edit the extracted contact/opportunity fields, optionally check for an existing contact, then manually save a contact, an optional company, and a structured lead note. The server checks again during save and blocks the whole promotion if the email or phone already exists. Deals are never created by this action.
+- Accounts are invite-only. Each customer workspace is isolated in SQLite. There is no hosted database or automated Unipile webhook; inbox sync still runs while the inbox page is open.
+- CRM contacts, companies, sales, tasks, notes, dashboard counts, and demo records come from the local SQLite database. Connecting Gmail or another Unipile account does not import it into CRM; the inbox and CRM are separate.
+- The app does not automatically import messages into CRM records. Classification and extraction do not create CRM records. Use **Add to CRM** on a conversation classified as a lead to review and edit the extracted contact/opportunity fields, optionally check for an existing contact, then manually save a contact, an optional company, and a structured lead note. The server checks again during save and blocks the whole promotion if the email or phone already exists. Sales are never created by this action.
 - Provider API availability and granted permissions determine which inbox data is available. Review provider permissions if an inbox cannot sync.
 - Automatic inbox lead classification sends newly observed inbound conversation text (at most 12,000 characters per request) to OpenRouter about once a minute while `/inbox` is open. If classified as a lead with confidence >= 0.40, a second automatic request sends the same conversation text and available sender name/email/phone metadata for detail extraction. The inbox displays the lead result and whether extraction succeeded. The first inbox sync seeds current messages as existing and does not submit that backlog. Earlier conversations remain opt-in through **Classify as lead**, followed by detail extraction from **Add to CRM**. Classification and extraction results are cached in browser local storage (including extracted contact details) to support the inbox display and avoid unnecessary repeat analysis. Do not use shared browser profiles for sensitive inboxes. Neither classification nor extraction changes CRM records until the user reviews and saves. OpenRouter/model-provider data handling and retention still apply. Never commit `.env`.
 - Lead classification uses confidence alone: confidence >= 0.40 is a lead, even if the model's `is_lead` field says false; below 0.40 is not a lead, even if that field says true. The API response explains when the confidence rule overrides the model's binary result. The CRM API independently rejects promotions without a lead classification; users must still review every extracted field before saving.

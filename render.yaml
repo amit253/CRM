@@ -1,0 +1,44 @@
+services:
+  - type: web
+    name: phigrad
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /api/health
+    plan: starter
+    envVars:
+      - key: PHIGRAD_ENV
+        value: production
+      - key: NODE_ENV
+        value: production
+      - key: APP_URL
+        sync: false
+      - key: LOCAL_API_TOKEN
+        sync: false
+      - key: UNIPILE_API_KEY
+        sync: false
+      - key: UNIPILE_API_BASE_URL
+        sync: false
+      - key: OPENROUTER_API_KEY
+        sync: false
+      - key: OPENROUTER_MODEL
+        value: openai/gpt-4o-mini
+      - key: SUPERADMIN_EMAIL
+        sync: false
+      - key: SUPERADMIN_INITIAL_PASSWORD
+        sync: false
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USERNAME
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SMTP_FROM
+        sync: false
+      - key: SMTP_USE_TLS
+        value: "true"
+    disk:
+      name: phigrad-data
+      mountPath: /app/data
+      sizeGB: 1

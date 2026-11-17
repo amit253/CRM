@@ -26,6 +26,7 @@ type RecentConversation = {
   kind: "email" | "chat";
   title: string;
   sender: string;
+  recipientEmail: string;
   preview: string;
   timestamp: string;
   messages: ConversationMessage[];
@@ -33,7 +34,7 @@ type RecentConversation = {
 
 type RecentConversationsProps = {
   enabled: boolean;
-  onUseConversation: (transcript: string, sender: string, title: string) => void;
+  onUseConversation: (transcript: string, sender: string, title: string, metadata?: { channel: string; kind: "email" | "chat"; accountId: string; conversationId: string; recipientEmail: string; subject: string }) => void;
 };
 
 const emailProviders = new Set(["google", "gmail", "outlook", "microsoft", "imap"]);
@@ -64,6 +65,26 @@ function text(value: unknown): string {
   for (const key of ["display_name", "name", "email", "address", "text", "body", "subject", "username"]) {
     const result = text(item[key]);
     if (result) return result;
+  }
+  return "";
+}
+
+function emailAddress(value: unknown): string {
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const email = emailAddress(item);
+      if (email) return email;
+    }
+    return "";
+  }
+  if (typeof value === "string") {
+    return value.match(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/i)?.[0] ?? "";
+  }
+  const item = object(value);
+  if (!item) return "";
+  for (const key of ["email", "address", "identifier", "from", "sender"]) {
+    const email = emailAddress(item[key]);
+    if (email) return email;
   }
   return "";
 }
@@ -161,6 +182,7 @@ function mapEmails(rows: Record<string, unknown>[], account: Account): RecentCon
       kind: "email" as const,
       title: text(latest.subject) || "(No subject)",
       sender,
+      recipientEmail: emailAddress(sender),
       preview: messages[messages.length - 1]?.text || "No preview available",
       timestamp: text(latest.date) || text(latest.timestamp) || text(latest.created_at),
       messages,
@@ -187,6 +209,7 @@ function mapChats(rows: Record<string, unknown>[], account: Account): RecentConv
       kind: "chat" as const,
       title: text(raw.name) || text(raw.title) || text(raw.sender) || "Conversation",
       sender: text(raw.from) || text(raw.sender) || text(raw.sender_name) || account.name,
+      recipientEmail: emailAddress(raw.user),
       preview: preview || "No preview available",
       timestamp: text(raw.last_message_timestamp) || text(raw.updated_at) || text(raw.timestamp),
       messages: [],
@@ -320,7 +343,7 @@ export default function RecentConversations({
       setConversations(limited);
       setError(outcomes.map((outcome) => outcome.error).filter(Boolean).join(" · "));
       if (!limited.length && !outcomes.some((outcome) => outcome.error)) {
-        setError(accounts.length ? "No recent conversations were returned by the connected accounts." : "No running Unipile accounts are connected.");
+        setError(accounts.length ? "No recent conversations were returned by the connected accounts." : "No connected accounts are available.");
       }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Could not load recent inbox conversations.");
@@ -370,7 +393,14 @@ export default function RecentConversations({
       setHistoryError("This conversation has too little readable text to analyze.");
       return;
     }
-    onUseConversation(transcript, selected.sender, selected.title);
+    onUseConversation(transcript, selected.sender, selected.title, {
+      channel: selected.channel,
+      kind: selected.kind,
+      accountId: selected.accountId,
+      conversationId: selected.id,
+      recipientEmail: selected.recipientEmail,
+      subject: selected.title,
+    });
   }
 
   return (
@@ -385,7 +415,7 @@ export default function RecentConversations({
           {loading ? "Loading…" : conversations.length ? "↻ Refresh inbox" : "Load recent"}
         </button>
       </header>
-      {!enabled && <p className="crm-recent-empty">Configure Unipile to load recent conversations.</p>}
+      {!enabled && <p className="crm-recent-empty">Connect an inbox to load recent conversations.</p>}
       {error && <p className="crm-recent-error" role="status">{error}</p>}
       {conversations.length > 0 && (
         <div className="crm-recent-content">

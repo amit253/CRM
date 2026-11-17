@@ -1,7 +1,8 @@
 "use client";
 
 import Link from "next/link";
-import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, MouseEvent as ReactMouseEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { WorkspaceSwitcher } from "@/components/workspace-switcher";
 
 type Provider =
   | "linkedin"
@@ -54,6 +55,7 @@ type UnifiedInboxProps = {
   aiConfigured: boolean;
   connection: "success" | "failed" | null;
   provider: string | null;
+  reason?: string | null;
 };
 
 type Classification = {
@@ -97,6 +99,16 @@ type LeadExtractionStatus =
 
 const LEAD_CLASSIFICATION_THRESHOLD = 0.4;
 const LEAD_POLICY_VERSION = "anand-leads-v3-confidence-only-0.4";
+
+function leadStatusLabel(classification: Classification) {
+  if (!classification.is_lead) return "Not a lead";
+  if (classification.confidence >= 0.75) return "Qualified lead";
+  return "Possible lead";
+}
+
+function publicReason(reason: string) {
+  return reason.replace(/^Marked (?:lead|not a lead) by the confidence-only 40% rule\. Classifier note:\s*/i, "");
+}
 
 function isClassification(value: unknown): value is Classification {
   const item = record(value);
@@ -189,8 +201,8 @@ function crmRequestError(payload: unknown, action: string): string {
         ? detailObject.message
         : "";
 
-  if (/FastAPI is not running|fetch failed|ECONNREFUSED/i.test(`${bridgeError} ${serverMessage}`)) {
-    return `Couldn't ${action} because the CRM backend isn't responding. Start FastAPI at http://127.0.0.1:8001, then try again.`;
+  if (/FastAPI (?:is not running|backend service)|fetch failed|ECONNREFUSED/i.test(`${bridgeError} ${serverMessage}`)) {
+    return `Couldn't ${action} because the CRM backend is currently unreachable. Please try again.`;
   }
   if (serverMessage) return serverMessage;
   if (Array.isArray(detail)) {
@@ -235,7 +247,7 @@ function emailAddress(value: unknown): string {
   }
   const item = record(value);
   if (!item) return "";
-  for (const key of ["email", "address", "display_name", "name"]) {
+  for (const key of ["email", "address", "identifier", "display_name", "name"]) {
     const email = emailAddress(item[key]);
     if (email) return email;
   }
@@ -250,9 +262,14 @@ function phoneNumber(value: unknown): string {
     }
     return "";
   }
+  if (typeof value === "string") {
+    return /[+\d][\d\s().-]{6,}/.test(value)
+      ? value.match(/\+?[\d][\d\s().-]{6,}\d/)?.[0]?.trim() ?? ""
+      : "";
+  }
   const item = record(value);
   if (!item) return "";
-  for (const key of ["phone", "phone_number", "mobile", "number", "display_name", "name"]) {
+  for (const key of ["phone", "phone_number", "mobile", "number", "identifier", "display_name", "name"]) {
     const candidate = item[key];
     if (typeof candidate === "string" && /[+\d][\d\s().-]{6,}/.test(candidate)) {
       return candidate.match(/\+?[\d][\d\s().-]{6,}\d/)?.[0]?.trim() ?? "";
@@ -289,11 +306,11 @@ function messageIdentity(raw: Record<string, unknown>, kind: "email" | "chat"): 
 function listData(value: unknown): Record<string, unknown>[] {
   const payload = record(value);
   if (!Array.isArray(payload?.data)) {
-    throw new Error("Unipile returned an unexpected response; expected a data list.");
+    throw new Error("The inbox returned an unexpected response.");
   }
   const rows = payload.data.map(record);
   if (rows.some((item) => item === null)) {
-    throw new Error("Unipile returned an unexpected item in the data list.");
+    throw new Error("The inbox returned an unexpected conversation.");
   }
   return rows.filter((item): item is Record<string, unknown> => item !== null);
 }
@@ -337,6 +354,63 @@ function senderDisplayName(item: InboxItem): string {
     : "";
 }
 
+function isSelfAttendee(value: unknown): boolean {
+  const item = record(value);
+  return Boolean(item && (item.is_self === true || item.self === true));
+}
+
+function counterpartAttendee(raw: Record<string, unknown>): unknown {
+  const groups = [
+    raw.from_attendee,
+    raw.from_attendees,
+    raw.from,
+    raw.sender,
+    raw.sender_attendee,
+    raw.user,
+    raw.attendees,
+    raw.participants,
+  ];
+  const attendees: unknown[] = [];
+  for (const group of groups) {
+    if (Array.isArray(group)) attendees.push(...group);
+    else if (group) attendees.push(group);
+  }
+  return attendees.find((attendee) => !isSelfAttendee(attendee)) ?? attendees[0] ?? null;
+}
+
+function senderEmailFromRaw(raw: Record<string, unknown>): string {
+  return (
+    emailAddress(raw.from_attendee) ||
+    emailAddress(counterpartAttendee(raw)) ||
+    emailAddress(raw.from) ||
+    emailAddress(raw.sender) ||
+    emailAddress(raw.reply_to_attendees) ||
+    text(raw.sender_email)
+  );
+}
+
+function senderPhoneFromRaw(raw: Record<string, unknown>): string {
+  return (
+    phoneNumber(raw.from_attendee) ||
+    phoneNumber(counterpartAttendee(raw)) ||
+    phoneNumber(raw.from) ||
+    phoneNumber(raw.sender) ||
+    text(raw.sender_phone) ||
+    text(raw.phone)
+  );
+}
+
+function senderNameFromRaw(raw: Record<string, unknown>, fallback: string): string {
+  return (
+    text(raw.from_attendee) ||
+    text(counterpartAttendee(raw)) ||
+    text(raw.from) ||
+    text(raw.sender) ||
+    text(raw.sender_name) ||
+    fallback
+  );
+}
+
 function ProviderSymbol({ provider }: { provider: string }) {
   const normalized = provider.toLowerCase();
   if (normalized === "linkedin") {
@@ -370,7 +444,7 @@ function endpointFor(account: Account): "emails" | "chats" {
 function normalizeItem(raw: Record<string, unknown>, account: Account, kind: "email" | "chat"): InboxItem {
   const id = text(raw.id) || `${kind}-${Math.random().toString(36).slice(2)}`;
   const channel = providerLabel(account.provider);
-  const from = text(raw.from) || text(raw.sender) || text(raw.sender_name);
+  const from = senderNameFromRaw(raw, "");
   const chatLastMessage = record(raw.last_message);
   const preview = kind === "email"
     ? text(raw.snippet) || text(raw.body_plain) || text(raw.body)
@@ -394,14 +468,16 @@ function normalizeItem(raw: Record<string, unknown>, account: Account, kind: "em
     kind,
     title,
     sender: from || (kind === "email" ? account.name : title),
-    senderEmail: emailAddress(raw.from) || emailAddress(raw.sender) || text(raw.sender_email),
-    senderPhone: phoneNumber(raw.from) || phoneNumber(raw.sender) || text(raw.sender_phone) || text(raw.phone),
+    senderEmail: senderEmailFromRaw(raw),
+    senderPhone: senderPhoneFromRaw(raw),
     preview: plainText(preview).replace(/\s+/g, " ") || "No preview available",
     content: kind === "email" ? plainText(text(raw.body_plain) || text(raw.body) || preview) : "",
     timestamp,
     unread: kind === "email" ? Boolean(raw.is_unread) : unreadCount > 0,
     messageIdentity: messageIdentity(raw, kind),
-    inbound: kind === "chat" || (
+    inbound: kind === "chat"
+      ? chatLastMessage?.is_sender === false
+      : (
       raw.is_sender !== true &&
       raw.is_sent !== true &&
       direction !== "sent" &&
@@ -426,7 +502,7 @@ async function getJson(path: string): Promise<unknown> {
   const body: unknown = await response.json().catch(() => null);
   if (!response.ok) {
     const detail = record(body)?.detail ?? record(body)?.error;
-    throw new Error(typeof detail === "string" ? detail : `Unipile request failed (${response.status}).`);
+    throw new Error(typeof detail === "string" ? detail : `The inbox request failed (${response.status}).`);
   }
   return body;
 }
@@ -450,7 +526,7 @@ async function loadAccountConversations(
   const results = await Promise.all(inboxes.map(async (inbox) => {
     const inboxId = text(inbox.id);
     if (!inboxId) {
-      return { rows: [] as Record<string, unknown>[], error: "Unipile returned an inbox without an ID." };
+      return { rows: [] as Record<string, unknown>[], error: "A connected inbox did not include an ID." };
     }
 
     try {
@@ -474,7 +550,7 @@ async function loadAccountConversations(
   return { kind, rows: [...rowsById.values()], error: errors.join(" · ") };
 }
 
-export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, provider }: UnifiedInboxProps) {
+export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, provider, reason }: UnifiedInboxProps) {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [items, setItems] = useState<InboxItem[]>([]);
   const [selectedKey, setSelectedKey] = useState<string | null>(null);
@@ -498,7 +574,6 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
   const [classifications, setClassifications] = useState<Record<string, Classification>>({});
   const [leadExtractions, setLeadExtractions] = useState<Record<string, LeadExtractionStatus>>({});
   const [automaticAnalysisError, setAutomaticAnalysisError] = useState("");
-  const [manualAnalysisLoading, setManualAnalysisLoading] = useState(false);
   const [manualAnalysisError, setManualAnalysisError] = useState("");
   const [promotionOpen, setPromotionOpen] = useState(false);
   const [promotionForm, setPromotionForm] = useState<LeadExtraction | null>(null);
@@ -510,13 +585,26 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
   const [promotionDuplicateLoading, setPromotionDuplicateLoading] = useState(false);
   const [promotionExtractionError, setPromotionExtractionError] = useState("");
   const [promotionSuccess, setPromotionSuccess] = useState("");
+  const [promotionDetailsVerified, setPromotionDetailsVerified] = useState(false);
+  const [promotionTargetKey, setPromotionTargetKey] = useState<string | null>(null);
+  const [promotionTranscript, setPromotionTranscript] = useState("");
+  const [promotionPreparingKey, setPromotionPreparingKey] = useState<string | null>(null);
+  const [manualAnalysisKey, setManualAnalysisKey] = useState<string | null>(null);
+  const [manualAnalysisErrorKey, setManualAnalysisErrorKey] = useState<string | null>(null);
+  const [conversationWidth, setConversationWidth] = useState(380);
+  const [splitterDragging, setSplitterDragging] = useState(false);
+  const [isNarrowInbox, setIsNarrowInbox] = useState(false);
   const seenMessageIdentities = useRef(new Set<string>());
+  const syncedMessageIdentities = useRef(new Set<string>());
+  const syncingIdentities = useRef(new Set<string>());
   const initialSyncComplete = useRef(false);
   const inboxRequestInProgress = useRef(false);
   const classifyingIdentities = useRef(new Set<string>());
   const classificationsRef = useRef<Record<string, Classification>>({});
   const leadExtractionsRef = useRef<Record<string, LeadExtractionStatus>>({});
   const promotionExtractionRun = useRef(0);
+  const splitterCleanup = useRef<(() => void) | null>(null);
+  const workspaceIdRef = useRef("default_workspace");
 
   const persistSeenIdentity = useCallback((identity: string) => {
     seenMessageIdentities.current.add(identity);
@@ -526,11 +614,27 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
     }
     try {
       localStorage.setItem(
-        "phigrad-inbox-seen-messages",
+        `phigrad-inbox-seen-messages:${workspaceIdRef.current}`,
         JSON.stringify([...seenMessageIdentities.current].slice(-1000)),
       );
     } catch {
       setAutomaticAnalysisError("Automatic analysis may repeat after this page closes because local inbox state could not be saved.");
+    }
+  }, []);
+
+  const persistSyncedIdentity = useCallback((identity: string) => {
+    syncedMessageIdentities.current.add(identity);
+    while (syncedMessageIdentities.current.size > 2000) {
+      const oldest = syncedMessageIdentities.current.values().next().value;
+      if (typeof oldest === "string") syncedMessageIdentities.current.delete(oldest);
+    }
+    try {
+      localStorage.setItem(
+        `phigrad-inbox-crm-synced:${workspaceIdRef.current}`,
+        JSON.stringify([...syncedMessageIdentities.current].slice(-2000)),
+      );
+    } catch {
+      setAutomaticAnalysisError("Inbox-to-CRM sync state could not be saved; duplicate checks will rely on the CRM database.");
     }
   }, []);
 
@@ -539,11 +643,23 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
     const entries = Object.entries(updated).slice(-500);
     classificationsRef.current = Object.fromEntries(entries);
     setClassifications(classificationsRef.current);
-    try {
-      localStorage.setItem("phigrad-inbox-classifications", JSON.stringify(entries));
-    } catch {
-      setAutomaticAnalysisError("Classification results will be cleared when this page closes because local storage is unavailable.");
-    }
+    void fetch("/api/crm/inbox/classifications", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        conversation_key: itemKey,
+        is_lead: classification.is_lead,
+        confidence: classification.confidence,
+        reason: classification.reason,
+        source: classification.source,
+        extraction_status: "",
+        extraction: null,
+      }),
+    }).then((response) => {
+      if (!response.ok) setAutomaticAnalysisError("The lead status could not be saved for this workspace.");
+    }).catch(() => {
+      setAutomaticAnalysisError("The lead status could not be saved for this workspace.");
+    });
   }, []);
 
   const saveLeadExtractionStatus = useCallback((itemKey: string, status: LeadExtractionStatus) => {
@@ -551,16 +667,23 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
     const entries = Object.entries(updated).slice(-500);
     leadExtractionsRef.current = Object.fromEntries(entries);
     setLeadExtractions(leadExtractionsRef.current);
-    try {
-      localStorage.setItem(
-        "phigrad-inbox-lead-extractions",
-        JSON.stringify(entries.filter((entry): entry is [string, Extract<LeadExtractionStatus, { status: "complete" }>] =>
-          entry[1].status === "complete",
-        )),
-      );
-    } catch {
-      setAutomaticAnalysisError("Extracted lead details may need to be fetched again after this page closes because local storage is unavailable.");
-    }
+    const classification = classificationsRef.current[itemKey];
+    if (!classification || status.status === "pending") return;
+    void fetch("/api/crm/inbox/classifications", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        conversation_key: itemKey,
+        is_lead: classification.is_lead,
+        confidence: classification.confidence,
+        reason: classification.reason,
+        source: classification.source,
+        extraction_status: status.status,
+        extraction: status.status === "complete" ? status.details : null,
+      }),
+    }).catch(() => {
+      setAutomaticAnalysisError("Lead details could not be saved for this workspace.");
+    });
   }, []);
 
   const requestClassification = useCallback(async (messageText: string): Promise<Omit<Classification, "source" | "classified_at">> => {
@@ -615,6 +738,90 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
     return result;
   }, []);
 
+  const syncNewMessages = useCallback(async (candidates: InboxItem[]) => {
+    const syncOne = async (item: InboxItem) => {
+      const identity = `${item.accountId}:${item.kind}:${item.messageIdentity}`;
+      if (syncedMessageIdentities.current.has(identity) || syncingIdentities.current.has(identity)) return;
+      syncingIdentities.current.add(identity);
+      try {
+        if (!item.inbound) {
+          persistSyncedIdentity(identity);
+          return;
+        }
+
+        let messageId = item.messageIdentity;
+        let timestamp = item.timestamp;
+        let body = item.content || item.preview;
+        let senderName = item.sender;
+        if (item.kind === "chat") {
+          const response = await getJson(
+            `/v2/${encodeURIComponent(item.accountId)}/chats/${encodeURIComponent(item.id)}/messages?limit=50`,
+          );
+          const messages = listData(response).map((raw) => ({
+            id: text(raw.id),
+            timestamp: text(raw.timestamp) || text(raw.date),
+            text: plainText(text(raw.text) || text(raw.body) || text(raw.message)),
+            sender: text(raw.sender_display_name) || text(raw.sender_name) || text(raw.sender_id),
+            isSender: typeof raw.is_sender === "boolean" ? raw.is_sender : null,
+          })).filter((message) => message.text).sort((left, right) =>
+            (Date.parse(left.timestamp) || 0) - (Date.parse(right.timestamp) || 0),
+          );
+          const latest = messages.at(-1);
+          if (!latest || latest.isSender !== false) {
+            // Don't import a message when Unipile cannot confirm that it came from the other person.
+            persistSyncedIdentity(identity);
+            return;
+          }
+          messageId = latest.id || item.messageIdentity;
+          timestamp = latest.timestamp || item.timestamp;
+          body = latest.text;
+          senderName = latest.sender || item.sender;
+        }
+
+        if (!body.trim() || !messageId) {
+          persistSyncedIdentity(identity);
+          return;
+        }
+        const response = await fetch("/api/crm/inbox/sync-message", {
+          method: "POST",
+          cache: "no-store",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            account_id: item.accountId,
+            channel: item.channel,
+            conversation_id: item.id,
+            conversation_kind: item.kind,
+            message_id: messageId,
+            timestamp,
+            sender_name: senderName,
+            sender_email: item.senderEmail,
+            sender_phone: item.senderPhone,
+            direction: "inbound",
+            body,
+          }),
+        });
+        const result: unknown = await response.json().catch(() => null);
+        const syncResult = record(result);
+        if (response.ok && syncResult?.synced === true) {
+          persistSyncedIdentity(identity);
+        }
+      } catch {
+        // Keep the identity pending so the next inbox refresh can retry the CRM sync.
+      } finally {
+        syncingIdentities.current.delete(identity);
+      }
+    };
+
+    let nextIndex = 0;
+    await Promise.all(Array.from({ length: Math.min(3, candidates.length) }, async () => {
+      while (nextIndex < candidates.length) {
+        const item = candidates[nextIndex];
+        nextIndex += 1;
+        await syncOne(item);
+      }
+    }));
+  }, [persistSyncedIdentity]);
+
   const classifyNewMessages = useCallback(async (candidates: InboxItem[]) => {
     const classifyOne = async (item: InboxItem) => {
       const identity = `${item.accountId}:${item.kind}:${item.messageIdentity}`;
@@ -629,12 +836,12 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
           const messages = listData(response).map((raw) => ({
             timestamp: text(raw.timestamp) || text(raw.date),
             text: plainText(text(raw.text) || text(raw.body) || text(raw.message)),
-            isSender: raw.is_sender === true,
+            isSender: typeof raw.is_sender === "boolean" ? raw.is_sender : null,
           })).filter((message) => message.text).sort((left, right) =>
             (Date.parse(left.timestamp) || 0) - (Date.parse(right.timestamp) || 0),
           );
           const latest = messages.at(-1);
-          if (!latest || latest.isSender) {
+          if (!latest || latest.isSender !== false) {
             persistSeenIdentity(identity);
             return;
           }
@@ -654,7 +861,6 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
         };
         saveClassification(item.key, classification);
         persistSeenIdentity(identity);
-        setAutomaticAnalysisError("");
         if (classification.is_lead) {
           saveLeadExtractionStatus(item.key, { status: "pending" });
           try {
@@ -744,18 +950,19 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
         initialSyncComplete.current = true;
         try {
           localStorage.setItem(
-            "phigrad-inbox-seen-messages",
+            `phigrad-inbox-seen-messages:${workspaceIdRef.current}`,
             JSON.stringify([...seenMessageIdentities.current].slice(-1000)),
           );
         } catch {
           setAutomaticAnalysisError("Automatic analysis may repeat after this page closes because local inbox state could not be saved.");
         }
-      } else if (checkForNewMessages && aiConfigured) {
-        void classifyNewMessages(
-          nextItems.filter((item) =>
-            !seenMessageIdentities.current.has(`${item.accountId}:${item.kind}:${item.messageIdentity}`),
-          ),
+      } else if (checkForNewMessages) {
+        const candidates = nextItems.filter((item) =>
+          !seenMessageIdentities.current.has(`${item.accountId}:${item.kind}:${item.messageIdentity}`) ||
+          !syncedMessageIdentities.current.has(`${item.accountId}:${item.kind}:${item.messageIdentity}`),
         );
+        void syncNewMessages(candidates);
+        if (aiConfigured) void classifyNewMessages(candidates);
       }
     } catch (error) {
       setLoadError(error instanceof Error ? error.message : "Could not load connected accounts.");
@@ -763,44 +970,75 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
       setLoading(false);
       inboxRequestInProgress.current = false;
     }
-  }, [aiConfigured, classifyNewMessages]);
+  }, [aiConfigured, classifyNewMessages, syncNewMessages]);
 
   useEffect(() => {
-    try {
-      const storedSeen: unknown = JSON.parse(localStorage.getItem("phigrad-inbox-seen-messages") ?? "[]");
-      if (Array.isArray(storedSeen)) {
-        storedSeen.filter((value): value is string => typeof value === "string").forEach((value) => seenMessageIdentities.current.add(value));
-        initialSyncComplete.current = storedSeen.length > 0;
+    let cancelled = false;
+    async function restoreWorkspaceState() {
+      localStorage.removeItem("phigrad-inbox-classifications");
+      localStorage.removeItem("phigrad-inbox-lead-extractions");
+      localStorage.setItem("phigrad-inbox-lead-policy", LEAD_POLICY_VERSION);
+      try {
+        const workspaceResponse = await fetch("/api/workspace", { cache: "no-store" });
+        const workspace: unknown = await workspaceResponse.json();
+        const workspaceId = record(workspace)?.id;
+        if (typeof workspaceId === "string" && workspaceId) workspaceIdRef.current = workspaceId;
+      } catch {
+        workspaceIdRef.current = "default_workspace";
       }
-      const policyIsCurrent = localStorage.getItem("phigrad-inbox-lead-policy") === LEAD_POLICY_VERSION;
-      if (!policyIsCurrent) {
-        localStorage.removeItem("phigrad-inbox-classifications");
-        localStorage.removeItem("phigrad-inbox-lead-extractions");
-        localStorage.setItem("phigrad-inbox-lead-policy", LEAD_POLICY_VERSION);
-      } else {
-        const storedClassifications: unknown = JSON.parse(localStorage.getItem("phigrad-inbox-classifications") ?? "[]");
-        if (Array.isArray(storedClassifications)) {
-          const valid = storedClassifications.flatMap((entry) => {
-            if (!Array.isArray(entry) || typeof entry[0] !== "string" || !isClassification(entry[1])) return [];
-            return [[entry[0], entry[1]] as const];
-          });
-          classificationsRef.current = Object.fromEntries(valid.slice(-500));
-          setClassifications(classificationsRef.current);
+      try {
+        const storedSeen: unknown = JSON.parse(localStorage.getItem(`phigrad-inbox-seen-messages:${workspaceIdRef.current}`) ?? "[]");
+        if (Array.isArray(storedSeen)) {
+          storedSeen.filter((value): value is string => typeof value === "string").forEach((value) => seenMessageIdentities.current.add(value));
+          initialSyncComplete.current = storedSeen.length > 0;
         }
-        const storedExtractions: unknown = JSON.parse(localStorage.getItem("phigrad-inbox-lead-extractions") ?? "[]");
-        if (Array.isArray(storedExtractions)) {
-          const valid = storedExtractions.flatMap((entry) => {
-            if (!Array.isArray(entry) || typeof entry[0] !== "string" || !isLeadExtraction(entry[1])) return [];
-            return [[entry[0], { status: "complete", details: entry[1] } as const] as const];
-          });
-          leadExtractionsRef.current = Object.fromEntries(valid.slice(-500));
-          setLeadExtractions(leadExtractionsRef.current);
+        const storedSynced: unknown = JSON.parse(localStorage.getItem(`phigrad-inbox-crm-synced:${workspaceIdRef.current}`) ?? "[]");
+        if (Array.isArray(storedSynced)) {
+          storedSynced.filter((value): value is string => typeof value === "string").forEach((value) => syncedMessageIdentities.current.add(value));
         }
+      } catch {
+        setAutomaticAnalysisError("Saved inbox progress could not be read; new messages may be reviewed again.");
       }
-    } catch {
-      setAutomaticAnalysisError("Saved inbox classifications could not be read; older conversations will not be sent automatically.");
+      try {
+        const response = await fetch("/api/crm/inbox/classifications", { cache: "no-store" });
+        const payload: unknown = await response.json();
+        if (response.ok && Array.isArray(payload)) {
+          const classifications: Record<string, Classification> = {};
+          const extractions: Record<string, LeadExtractionStatus> = {};
+          payload.forEach((entry) => {
+            const item = record(entry);
+            const key = item?.conversation_key;
+            if (!item || typeof key !== "string") return;
+            const classification = {
+              is_lead: item.is_lead === true,
+              confidence: typeof item.confidence === "number" ? item.confidence : 0,
+              reason: typeof item.reason === "string" ? item.reason : "",
+              source: item.source === "manual" ? "manual" as const : "automatic" as const,
+              classified_at: typeof item.updated_at === "string" ? item.updated_at : "",
+            };
+            if (isClassification(classification)) classifications[key] = classification;
+            if (item.extraction_status === "complete" && isLeadExtraction(item.extraction)) {
+              extractions[key] = { status: "complete", details: item.extraction };
+            } else if (item.extraction_status === "failed") {
+              extractions[key] = { status: "failed", error: "Lead details need to be extracted again." };
+            }
+          });
+          classificationsRef.current = classifications;
+          leadExtractionsRef.current = extractions;
+          if (!cancelled) {
+            setClassifications(classifications);
+            setLeadExtractions(extractions);
+          }
+        }
+      } catch {
+        if (!cancelled) setAutomaticAnalysisError("Saved lead statuses could not be loaded.");
+      }
+      if (!cancelled) void loadInbox(false);
     }
-    void loadInbox(false);
+    void restoreWorkspaceState();
+    return () => {
+      cancelled = true;
+    };
   }, [loadInbox]);
 
   useEffect(() => {
@@ -824,6 +1062,17 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
     });
   }, [filter, items, search]);
   const selectedItem = items.find((item) => item.key === selectedKey) ?? null;
+  const promotionItem = items.find((item) => item.key === promotionTargetKey) ?? null;
+
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 760px)");
+    const apply = () => setIsNarrowInbox(media.matches);
+    apply();
+    media.addEventListener("change", apply);
+    return () => media.removeEventListener("change", apply);
+  }, []);
+
+  useEffect(() => () => splitterCleanup.current?.(), []);
 
   function selectedConversationText(item: InboxItem): string {
     if (item.kind === "email") return item.content;
@@ -832,27 +1081,97 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
       .join("\n\n");
   }
 
-  async function analyzeSelectedConversation() {
-    if (!selectedItem) return;
-    const conversationText = selectedConversationText(selectedItem);
-    if (conversationText.trim().length < 10) {
-      setManualAnalysisError("There is not enough readable conversation history to classify as a lead.");
-      return;
-    }
-    setManualAnalysisLoading(true);
+  async function loadChatTranscript(item: InboxItem): Promise<string> {
+    const response = await getJson(
+      `/v2/${encodeURIComponent(item.accountId)}/chats/${encodeURIComponent(item.id)}/messages?limit=50`,
+    );
+    const messages = listData(response).map((raw) => ({
+      timestamp: text(raw.timestamp) || text(raw.date),
+      text: plainText(text(raw.text) || text(raw.body) || text(raw.message)),
+      isSender: Boolean(raw.is_sender),
+      sender: text(raw.sender) || text(raw.sender_name) || text(raw.sender_id) || (raw.is_sender ? "You" : item.sender),
+    })).filter((message) => message.text).sort((left, right) =>
+      (Date.parse(left.timestamp) || 0) - (Date.parse(right.timestamp) || 0),
+    );
+    return messages
+      .map((message) => `${message.isSender ? "Anand" : message.sender}: ${message.text}`)
+      .join("\n\n");
+  }
+
+  async function transcriptFor(item: InboxItem): Promise<string> {
+    if (item.kind === "email") return item.content;
+    if (item.key === selectedKey && chatMessages.length > 0) return selectedConversationText(item);
+    return loadChatTranscript(item);
+  }
+
+  function selectConversation(item: InboxItem) {
+    promotionExtractionRun.current += 1;
+    setPromotionExtracting(false);
+    setSelectedKey(item.key);
+    setManualAnalysisError("");
+    setPromotionOpen(false);
+    setPromotionError("");
+    setPromotionSuccess("");
+  }
+
+  function stopCardActivation(event: ReactMouseEvent<HTMLButtonElement>) {
+    event.preventDefault();
+    event.stopPropagation();
+  }
+
+  function startSplitterDrag(event: ReactMouseEvent<HTMLDivElement>) {
+    if (isNarrowInbox) return;
+    event.preventDefault();
+    const startX = event.clientX;
+    const startWidth = conversationWidth;
+    setSplitterDragging(true);
+    const previousCursor = document.body.style.cursor;
+    const previousUserSelect = document.body.style.userSelect;
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    const onMove = (moveEvent: MouseEvent) => {
+      setConversationWidth(Math.min(650, Math.max(280, startWidth + moveEvent.clientX - startX)));
+    };
+    const finish = () => {
+      setSplitterDragging(false);
+      document.body.style.cursor = previousCursor;
+      document.body.style.userSelect = previousUserSelect;
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", finish);
+      splitterCleanup.current = null;
+    };
+    splitterCleanup.current = finish;
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", finish);
+  }
+
+  async function analyzeConversation(item: InboxItem) {
+    setManualAnalysisKey(item.key);
+    setManualAnalysisErrorKey(item.key);
     setManualAnalysisError("");
     try {
+      const conversationText = await transcriptFor(item);
+      if (conversationText.trim().length < 10) {
+        setManualAnalysisError("There is not enough readable conversation history to classify as a lead.");
+        return;
+      }
       const result = await requestClassification(conversationText);
-      saveClassification(selectedItem.key, {
+      saveClassification(item.key, {
         ...result,
         source: "manual",
         classified_at: new Date().toISOString(),
       });
+      setManualAnalysisErrorKey(null);
     } catch (error) {
       setManualAnalysisError(error instanceof Error ? error.message : "Could not analyze this conversation.");
     } finally {
-      setManualAnalysisLoading(false);
+      setManualAnalysisKey(null);
     }
+  }
+
+  function analyzeSelectedConversation() {
+    if (!selectedItem) return;
+    void analyzeConversation(selectedItem);
   }
 
   async function extractSelectedLeadDetails(item: InboxItem, conversationText: string) {
@@ -886,50 +1205,60 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
     }
   }
 
-  function beginPromotion() {
-    if (!selectedItem || !classifications[selectedItem.key]?.is_lead) return;
-    const conversationText = selectedConversationText(selectedItem);
-    const savedExtraction = leadExtractions[selectedItem.key];
-    const cachedDetails = savedExtraction?.status === "complete" ? savedExtraction.details : null;
-    promotionExtractionRun.current += 1;
-    setPromotionForm({
-      ...(cachedDetails ?? {}),
-      contact_name: cachedDetails?.contact_name || senderDisplayName(selectedItem) || null,
-      organisation: cachedDetails?.organisation ?? null,
-      role: cachedDetails?.role ?? null,
-      email: cachedDetails?.email || selectedItem.senderEmail || null,
-      phone: cachedDetails?.phone || selectedItem.senderPhone || null,
-      source: leadSource(selectedItem.channel),
-      service_interest: cachedDetails?.service_interest ?? "unclear",
-      lead_intent: cachedDetails?.lead_intent ?? "inquiry",
-      company_need: cachedDetails?.company_need ?? null,
-      event_or_programme: cachedDetails?.event_or_programme ?? null,
-      expected_audience: cachedDetails?.expected_audience ?? null,
-      location: cachedDetails?.location ?? null,
-      requested_date: cachedDetails?.requested_date ?? null,
-      budget: cachedDetails?.budget ?? null,
-      urgency: cachedDetails?.urgency ?? "unknown",
-      decision_maker: cachedDetails?.decision_maker ?? "unknown",
-      lead_stage: cachedDetails?.lead_stage ?? "new",
-      next_action: cachedDetails?.next_action ?? null,
-      next_action_date: cachedDetails?.next_action_date ?? null,
-      summary: cachedDetails?.summary ?? "",
-      qualification_notes: cachedDetails?.qualification_notes ?? null,
-    });
-    setPromotionNote(
-      `${selectedItem.channel} · ${selectedItem.title}\n${selectedItem.timestamp ? `${selectedItem.timestamp}\n` : ""}\n${conversationText || selectedItem.preview}`.slice(0, 12000),
-    );
+  async function beginPromotion(item: InboxItem) {
+    setPromotionPreparingKey(item.key);
     setPromotionError("");
-    setPromotionDuplicateCheck(null);
-    setPromotionExtractionError("");
-    setPromotionSuccess("");
-    setPromotionOpen(true);
-    if (cachedDetails) {
-      setPromotionExtracting(false);
-    } else if (conversationText.trim().length >= 10) {
-      void extractSelectedLeadDetails(selectedItem, conversationText);
-    } else {
-      setPromotionExtractionError("There is not enough readable conversation history to extract lead details. Enter them manually.");
+    try {
+      const conversationText = await transcriptFor(item);
+      const savedExtraction = leadExtractionsRef.current[item.key];
+      const cachedDetails = savedExtraction?.status === "complete" ? savedExtraction.details : null;
+      promotionExtractionRun.current += 1;
+      setPromotionTargetKey(item.key);
+      setPromotionTranscript(conversationText);
+      setPromotionForm({
+        ...(cachedDetails ?? {}),
+        contact_name: cachedDetails?.contact_name || senderDisplayName(item) || null,
+        organisation: cachedDetails?.organisation ?? null,
+        role: cachedDetails?.role ?? null,
+        email: cachedDetails?.email || item.senderEmail || null,
+        phone: cachedDetails?.phone || item.senderPhone || null,
+        source: leadSource(item.channel),
+        service_interest: cachedDetails?.service_interest ?? "unclear",
+        lead_intent: cachedDetails?.lead_intent ?? "inquiry",
+        company_need: cachedDetails?.company_need ?? null,
+        event_or_programme: cachedDetails?.event_or_programme ?? null,
+        expected_audience: cachedDetails?.expected_audience ?? null,
+        location: cachedDetails?.location ?? null,
+        requested_date: cachedDetails?.requested_date ?? null,
+        budget: cachedDetails?.budget ?? null,
+        urgency: cachedDetails?.urgency ?? "unknown",
+        decision_maker: cachedDetails?.decision_maker ?? "unknown",
+        lead_stage: cachedDetails?.lead_stage ?? "new",
+        next_action: cachedDetails?.next_action ?? null,
+        next_action_date: cachedDetails?.next_action_date ?? null,
+        summary: cachedDetails?.summary ?? "",
+        qualification_notes: cachedDetails?.qualification_notes ?? null,
+      });
+      setPromotionNote(
+        `${item.channel} · ${item.title}\n${item.timestamp ? `${item.timestamp}\n` : ""}\n${conversationText || item.preview}`.slice(0, 12000),
+      );
+      setPromotionDuplicateCheck(null);
+      setPromotionExtractionError("");
+      setPromotionSuccess("");
+      setPromotionDetailsVerified(false);
+      setPromotionOpen(true);
+      if (cachedDetails) {
+        setPromotionExtracting(false);
+      } else if (classificationsRef.current[item.key]?.is_lead && conversationText.trim().length >= 10 && aiConfigured) {
+        void extractSelectedLeadDetails(item, conversationText);
+      } else {
+        setPromotionExtracting(false);
+      }
+    } catch (error) {
+      setManualAnalysisErrorKey(item.key);
+      setManualAnalysisError(error instanceof Error ? error.message : "Could not open this conversation for CRM.");
+    } finally {
+      setPromotionPreparingKey(null);
     }
   }
 
@@ -979,7 +1308,7 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
       const message = error instanceof Error ? error.message : "";
       setPromotionError(
         /failed to fetch|networkerror/i.test(message)
-          ? "Couldn't check for an existing customer because the CRM backend isn't responding. Start FastAPI at http://127.0.0.1:8001, then try again."
+          ? "Couldn't check for an existing customer because the CRM backend is currently unreachable. Please try again."
           : message || "Couldn't check for an existing customer. Please try again.",
       );
     } finally {
@@ -989,15 +1318,15 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
 
   async function submitPromotion(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    if (!selectedItem || !promotionForm || !classifications[selectedItem.key]?.is_lead) return;
+    if (!promotionItem || !promotionForm) return;
     setPromotionLoading(true);
     setPromotionError("");
     try {
       const fullName = (promotionForm.contact_name ?? "").trim();
       const nameParts = fullName.split(/\s+/).filter(Boolean);
-      const leadClassification = classifications[selectedItem.key];
+      const leadClassification = classifications[promotionItem.key];
       if (!nameParts[0]) {
-        throw new Error("Enter the lead contact's first name before saving.");
+        throw new Error("Enter the contact's first name before saving.");
       }
       const response = await fetch("/api/crm/inbox-promotions", {
         method: "POST",
@@ -1011,52 +1340,32 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
           role: (promotionForm.role ?? "").trim(),
           company_name: (promotionForm.organisation ?? "").trim(),
           company_domain: "",
-          source: `Unipile · ${selectedItem.channel}`,
+          source: `Inbox · ${promotionItem.channel}`,
           note: promotionNote.trim(),
-          classification: {
+          channel: promotionItem.channel,
+          account_id: promotionItem.accountId,
+          conversation_id: promotionItem.id,
+          conversation_kind: promotionItem.kind,
+          message_id: promotionItem.messageIdentity,
+          message_timestamp: promotionItem.timestamp,
+          details_verified: promotionDetailsVerified,
+          classification: leadClassification ? {
             is_lead: leadClassification.is_lead,
             confidence: leadClassification.confidence,
             reason: leadClassification.reason,
-          },
-          lead_details: promotionForm,
+          } : null,
+          lead_details: leadClassification?.is_lead ? promotionForm : null,
         }),
       });
       const payload: unknown = await response.json().catch(() => null);
       const result = record(payload);
       if (!response.ok || typeof result?.contact_id !== "string") {
-        const detail = result?.detail;
-        const duplicateDetail = record(detail);
-        if (duplicateDetail?.code === "duplicate_contact" && Array.isArray(duplicateDetail.matches)) {
-          const matches = duplicateDetail.matches.flatMap((item): DuplicateContact[] => {
-            const match = record(item);
-            if (
-              !match ||
-              typeof match.id !== "string" ||
-              typeof match.name !== "string" ||
-              typeof match.email !== "string" ||
-              typeof match.phone !== "string" ||
-              !Array.isArray(match.matched_fields)
-            ) return [];
-            return [{
-              id: match.id,
-              name: match.name,
-              email: match.email,
-              phone: match.phone,
-              company_name: typeof match.company_name === "string" ? match.company_name : null,
-              matched_fields: match.matched_fields.filter((field): field is string => typeof field === "string"),
-            }];
-          });
-          setPromotionDuplicateCheck({
-            email: (promotionForm.email ?? "").trim(),
-            phone: (promotionForm.phone ?? "").trim(),
-            matches,
-          });
-          throw new Error(typeof duplicateDetail.message === "string" ? duplicateDetail.message : "Customer already exists in CRM.");
-        }
-        throw new Error(crmRequestError(payload, "save this lead to CRM"));
+        throw new Error(crmRequestError(payload, "save to CRM"));
       }
       const changes = [
-        result.contact_created === true ? "contact added" : "existing contact updated",
+        result.merged === true
+          ? "existing contact updated with new channel/note"
+          : result.contact_created === true ? "contact added" : "existing contact updated",
         result.company_created === true ? "company added" : result.company_id ? "company linked" : "",
         "conversation saved as a note",
       ].filter(Boolean);
@@ -1066,8 +1375,8 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
       const message = error instanceof Error ? error.message : "";
       setPromotionError(
         /failed to fetch|networkerror/i.test(message)
-          ? "Couldn't save this lead because the CRM backend isn't responding. Start FastAPI at http://127.0.0.1:8001, then try again."
-          : message || "Couldn't save this lead to CRM. Please try again.",
+          ? "Couldn't save because the CRM backend is currently unreachable. Please try again."
+          : message || "Couldn't save to CRM. Please try again.",
       );
     } finally {
       setPromotionLoading(false);
@@ -1169,7 +1478,7 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
     <main className="unified-app">
       <aside className="unified-sidebar">
         <a className="unified-brand" href="#inbox"><span className="unified-brand-mark">p</span><span>phigrad</span></a>
-        <div className="unified-workspace"><span className="unified-workspace-icon">P</span><span><small>WORKSPACE</small><strong>Phigrad Studio</strong></span><b>⌄</b></div>
+        <WorkspaceSwitcher variant="inbox" />
         <span className="unified-nav-label">WORKSPACE</span>
         <nav className="unified-nav">
           <Link href="/"><span>⌂</span> CRM overview</Link>
@@ -1185,20 +1494,16 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
       <section className="unified-main" id="inbox">
         <header className="unified-topbar">
           <div className="unified-breadcrumb">Workspace <span>/</span> <strong>Inbox</strong></div>
-          <div className="unified-top-actions"><span className={apiConfigured ? "unified-live-dot" : "unified-status-missing"} /> {apiConfigured ? `${accounts.length} connected ${accounts.length === 1 ? "account" : "accounts"}` : "API key not configured"} <span className="unified-top-avatar">P</span></div>
+          <div className="unified-top-actions"><span className={apiConfigured ? "unified-live-dot" : "unified-status-missing"} /> {apiConfigured ? `${accounts.length} connected ${accounts.length === 1 ? "account" : "accounts"}` : "Inbox unavailable"} <span className="unified-top-avatar">P</span></div>
         </header>
         <div className="unified-content">
           {connection === "success" && <div className="unified-connection-notice" role="status"><strong>{provider ? providerLabel(provider) : "Account"} connected.</strong> Syncing conversations from your connected channel.</div>}
-          {connection === "failed" && <div className="unified-connection-notice failed" role="alert"><strong>Connection didn’t complete.</strong> Try again and check your Unipile settings if the issue persists.</div>}
+          {connection === "failed" && <div className="unified-connection-notice failed" role="alert"><strong>Connection didn’t complete.</strong> {reason === "already-connected" ? "This account is already connected to another workspace. In the Google window, choose a different account." : reason === "state" ? "Start the connection again from this same browser address." : "Try connecting the account again."}</div>}
           <div className="unified-page-heading">
             <div><span className="unified-eyebrow">YOUR COMMUNICATION HUB</span><h1>Unified inbox</h1><p>Stay on top of conversations across every connected channel.</p></div>
             <button type="button" className="unified-refresh" onClick={() => void loadInbox(true)} disabled={loading}>{loading ? "Syncing…" : "↻  Refresh inbox"}</button>
           </div>
-          <div className="unified-ai-notice" role="note">
-            {aiConfigured
-              ? "New incoming message text is sent to OpenRouter about once a minute while this inbox is open. If classified as a lead at 40% confidence or higher, sender metadata and conversation text are also sent for automatic detail extraction. No CRM record is saved without your review. Older conversations are only analyzed when requested."
-              : "Configure OpenRouter to classify new conversations against Anand’s business lead criteria. Older conversations can be classified on request."}
-          </div>
+          <div className={`unified-ai-status ${aiConfigured ? "ready" : ""}`} role="status">{aiConfigured ? "✦ AI Ready" : "AI unavailable"}</div>
           {automaticAnalysisError && <div className="unified-error" role="status"><strong>AI classification needs attention</strong><span>{automaticAnalysisError}</span></div>}
           <section className="unified-inbox-card" aria-label="Unified inbox">
             <div className="unified-inbox-toolbar">
@@ -1217,42 +1522,116 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
                 <span>{loadError || sourceErrors.join(" · ")}</span>
               </div>
             )}
-            <div className="unified-inbox-body">
-              <div className="unified-conversation-column">
+            <div className={`unified-inbox-body${isNarrowInbox ? "" : " is-split"}`}>
+              <div className="unified-conversation-column" style={isNarrowInbox ? undefined : { width: conversationWidth, flexBasis: conversationWidth }}>
                 <div className="unified-list-heading"><span>{loading ? "Syncing conversations…" : `${filteredItems.length} conversations`}</span><button type="button" onClick={() => void loadInbox(true)} aria-label="Refresh conversations">↻</button></div>
                 <div className="unified-conversation-list">
                   {!loading && filteredItems.length === 0 && (
                     <div className="unified-empty"><span className="unified-empty-icon">▤</span><strong>{accounts.length ? "No conversations found" : "Connect your first channel"}</strong><p>{accounts.length ? "Try another channel filter or check the account permissions." : "Connect Gmail, LinkedIn, Instagram, or another supported provider to see real conversations here."}</p><a href="#accounts">{accounts.length ? "Manage connected accounts" : "Connect an account"} <span>→</span></a></div>
                   )}
                   {filteredItems.map((item) => (
-                    <button type="button" key={item.key} className={`unified-conversation ${selectedKey === item.key ? "current" : ""}`} onClick={() => { promotionExtractionRun.current += 1; setPromotionExtracting(false); setSelectedKey(item.key); setManualAnalysisError(""); setPromotionOpen(false); setPromotionError(""); setPromotionSuccess(""); }}>
+                    <div
+                      role="button"
+                      tabIndex={0}
+                      key={item.key}
+                      className={`unified-conversation ${selectedKey === item.key ? "current" : ""}`}
+                      onClick={() => selectConversation(item)}
+                      onKeyDown={(event) => {
+                        if (event.target !== event.currentTarget) return;
+                        if (event.key === "Enter" || event.key === " ") {
+                          event.preventDefault();
+                          selectConversation(item);
+                        }
+                      }}
+                    >
                       <span className={`unified-contact-avatar channel-${item.channel.toLowerCase().replace(/[^a-z]/g, "")}`} aria-label={item.channel}><ProviderSymbol provider={item.channel} /></span>
                       <span className="unified-conversation-copy">
-                        <span className="unified-conversation-meta"><strong>{item.title}</strong><time>{formatTime(item.timestamp)}</time></span>
+                        <span className="unified-conversation-heading">
+                          <strong className="unified-conversation-title">{item.title}</strong>
+                          <span className="unified-conversation-time">
+                            <time>{formatTime(item.timestamp)}</time>
+                            {item.unread && <span className="unified-unread-dot" aria-label="Unread" />}
+                          </span>
+                        </span>
                         <span className="unified-conversation-channel"><span className={`unified-channel-icon channel-${item.channel.toLowerCase().replace(/[^a-z]/g, "")}`}><ProviderSymbol provider={item.channel} /></span>{item.channel}<i>·</i>{item.sender}</span>
                         <span className="unified-conversation-preview">{item.preview}</span>
-                        {classifications[item.key] && <span className={`unified-classification-badge relevance-${classifications[item.key].is_lead ? "business" : "not_business"}`}>{classifications[item.key].is_lead ? "Lead" : "Not a lead"} · {Math.round(classifications[item.key].confidence * 100)}%</span>}
-                        {classifications[item.key]?.is_lead && leadExtractions[item.key] && <span className={`unified-classification-badge extraction-${leadExtractions[item.key].status}`}>{leadExtractions[item.key].status === "complete" ? "Lead details ready" : leadExtractions[item.key].status === "pending" ? "Extracting lead details…" : "Details need review"}</span>}
+                        {classifications[item.key] && <span className={`unified-classification-badge relevance-${classifications[item.key].is_lead ? "business" : "not_business"}`}>{classifications[item.key].is_lead ? "★ " : ""}{leadStatusLabel(classifications[item.key])}</span>}
+                        {classifications[item.key]?.is_lead && leadExtractions[item.key] && <span className={`unified-classification-badge extraction-${leadExtractions[item.key].status}`}>{leadExtractions[item.key].status === "complete" ? "Details ready" : leadExtractions[item.key].status === "pending" ? "Reading details…" : "Details need review"}</span>}
+                        {manualAnalysisErrorKey === item.key && manualAnalysisError && <span className="unified-card-error">{manualAnalysisError}</span>}
                       </span>
-                      {item.unread && <span className="unified-unread-dot" aria-label="Unread" />}
-                    </button>
+                      <span className="unified-card-actions">
+                        <button
+                          type="button"
+                          className="unified-quick-action"
+                          title="Classify as lead"
+                          aria-label={`Classify ${item.title} as lead`}
+                          disabled={!aiConfigured || manualAnalysisKey === item.key}
+                          onClick={(event) => {
+                            stopCardActivation(event);
+                            void analyzeConversation(item);
+                          }}
+                        >
+                          {manualAnalysisKey === item.key ? "Classifying…" : "✦ Classify as lead"}
+                        </button>
+                        <button
+                          type="button"
+                          className="unified-quick-action primary"
+                          title="Add to CRM"
+                          aria-label={`Add ${item.title} to CRM`}
+                          disabled={promotionPreparingKey === item.key}
+                          onClick={(event) => {
+                            stopCardActivation(event);
+                            void beginPromotion(item);
+                          }}
+                        >
+                          {promotionPreparingKey === item.key ? "Opening…" : "＋ Add to CRM"}
+                        </button>
+                      </span>
+                    </div>
                   ))}
                 </div>
               </div>
-              <section className="unified-detail" aria-label="Conversation details">
+              {!isNarrowInbox && (
+                <div
+                  className={`unified-splitter unified-pane-resizer${splitterDragging ? " dragging resizing" : ""}`}
+                  role="separator"
+                  aria-orientation="vertical"
+                  aria-label="Resize conversation list"
+                  aria-valuemin={280}
+                  aria-valuemax={650}
+                  aria-valuenow={conversationWidth}
+                  tabIndex={0}
+                  onMouseDown={startSplitterDrag}
+                  onKeyDown={(event) => {
+                    if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+                    event.preventDefault();
+                    const delta = event.key === "ArrowLeft" ? -20 : 20;
+                    setConversationWidth((current) => Math.min(650, Math.max(280, current + delta)));
+                  }}
+                />
+              )}
+              <section className="unified-detail" aria-label="Conversation details" style={isNarrowInbox ? undefined : { flex: "1 1 auto" }}>
                 {selectedItem ? (
                   <>
                     <div key={selectedItem.key} className="unified-detail-transition">
                       <header className="unified-detail-header">
                         <span className={`unified-contact-avatar large channel-${selectedItem.channel.toLowerCase().replace(/[^a-z]/g, "")}`} aria-label={selectedItem.channel}><ProviderSymbol provider={selectedItem.channel} /></span>
                         <div><h2>{selectedItem.title}</h2><p>{selectedItem.sender} <span>·</span> {selectedItem.accountName}</p></div>
-                        <span className={`unified-detail-channel channel-${selectedItem.channel.toLowerCase().replace(/[^a-z]/g, "")}`}><ProviderSymbol provider={selectedItem.channel} />{selectedItem.channel}</span>
+                        <div className="unified-detail-header-actions">
+                          <button type="button" className="unified-action-secondary" onClick={() => void analyzeConversation(selectedItem)} disabled={!aiConfigured || manualAnalysisKey === selectedItem.key || messagesLoading}>
+                            {manualAnalysisKey === selectedItem.key ? "Classifying…" : "✦ Classify as lead"}
+                          </button>
+                          <button type="button" className="unified-action-primary" onClick={() => void beginPromotion(selectedItem)} disabled={messagesLoading || promotionPreparingKey === selectedItem.key || promotionExtracting || leadExtractions[selectedItem.key]?.status === "pending"}>
+                            {promotionPreparingKey === selectedItem.key ? "Opening…" : "＋ Add to CRM"}
+                          </button>
+                          <span className={`unified-detail-channel channel-${selectedItem.channel.toLowerCase().replace(/[^a-z]/g, "")}`}><ProviderSymbol provider={selectedItem.channel} />{selectedItem.channel}</span>
+                        </div>
                       </header>
                       <div className="unified-detail-body">
                         {selectedItem.kind === "email" ? (
                           <article className="unified-email">
                             <div className="unified-email-subject">{selectedItem.title}</div>
-                            <div className="unified-email-sender"><span className={`unified-contact-avatar small channel-${selectedItem.channel.toLowerCase().replace(/[^a-z]/g, "")}`} aria-label={selectedItem.channel}><ProviderSymbol provider={selectedItem.channel} /></span><div><strong>{selectedItem.sender}</strong><small>to {selectedItem.accountName}</small></div><time>{formatTime(selectedItem.timestamp)}</time></div>
+                            <div className="unified-email-sender"><span className={`unified-contact-avatar small channel-${selectedItem.channel.toLowerCase().replace(/[^a-z]/g, "")}`} aria-label={selectedItem.channel}><ProviderSymbol provider={selectedItem.channel} /></span><div><strong>{selectedItem.sender}</strong><small>{selectedItem.senderEmail ? `${selectedItem.senderEmail} · to ${selectedItem.accountName}` : `to ${selectedItem.accountName}`}</small></div><time>{formatTime(selectedItem.timestamp)}</time></div>
                             <div className="unified-email-content">{selectedItem.content || selectedItem.preview}</div>
                           </article>
                         ) : (
@@ -1272,8 +1651,8 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
                     <section className="unified-conversation-actions" aria-label="Conversation actions">
                       {classifications[selectedItem.key] && (
                         <div className={`unified-classification-result relevance-${classifications[selectedItem.key].is_lead ? "business" : "not_business"}`}>
-                          <strong>{classifications[selectedItem.key].is_lead ? "Potential business lead" : "Not classified as a lead"} · {Math.round(classifications[selectedItem.key].confidence * 100)}% confidence</strong>
-                          <p>{classifications[selectedItem.key].reason}</p>
+                          <strong>{leadStatusLabel(classifications[selectedItem.key])}</strong>
+                          <p>{publicReason(classifications[selectedItem.key].reason)}</p>
                         </div>
                       )}
                       {classifications[selectedItem.key]?.is_lead && leadExtractions[selectedItem.key] && (
@@ -1282,24 +1661,26 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
                         </p>
                       )}
                       <div className="unified-conversation-action-buttons">
-                        <button type="button" className="unified-action-secondary" onClick={() => void analyzeSelectedConversation()} disabled={!aiConfigured || manualAnalysisLoading || messagesLoading}>
-                          {manualAnalysisLoading ? "Classifying…" : "Classify as lead"}
+                        <button type="button" className="unified-action-secondary" onClick={analyzeSelectedConversation} disabled={!aiConfigured || manualAnalysisKey === selectedItem.key || messagesLoading}>
+                          {manualAnalysisKey === selectedItem.key ? "Classifying…" : "Classify as lead"}
                         </button>
-                        <button type="button" className="unified-action-primary" onClick={beginPromotion} disabled={!aiConfigured || !classifications[selectedItem.key]?.is_lead || messagesLoading || promotionExtracting || leadExtractions[selectedItem.key]?.status === "pending"}>
+                        <button type="button" className="unified-action-primary" onClick={() => void beginPromotion(selectedItem)} disabled={messagesLoading || promotionPreparingKey === selectedItem.key || promotionExtracting || leadExtractions[selectedItem.key]?.status === "pending"}>
                           Add to CRM
                         </button>
                       </div>
-                      {!aiConfigured && <p className="unified-action-hint">OpenRouter is not configured.</p>}
-                      {aiConfigured && !classifications[selectedItem.key] && <p className="unified-action-hint">Classify this conversation first. Older conversations are analyzed only when you choose this action.</p>}
-                      {aiConfigured && classifications[selectedItem.key] && !classifications[selectedItem.key].is_lead && <p className="unified-action-hint">Only conversations classified as genuine leads can be added to CRM.</p>}
-                      {manualAnalysisError && <p className="unified-action-error" role="alert">{manualAnalysisError}</p>}
+                      {!aiConfigured && <p className="unified-action-hint">AI classifier is not configured, but you can still add conversations directly to CRM.</p>}
+                      {manualAnalysisErrorKey === selectedItem.key && manualAnalysisError && <p className="unified-action-error" role="alert">{manualAnalysisError}</p>}
                       {promotionSuccess && <p className="unified-action-success" role="status">{promotionSuccess}</p>}
-                      {promotionOpen && promotionForm && (
-                        <form className="unified-promotion-form" onSubmit={(event) => void submitPromotion(event)}>
-                          <div className="unified-promotion-heading"><strong>Review extracted lead details</strong><button type="button" onClick={() => { promotionExtractionRun.current += 1; setPromotionExtracting(false); setPromotionOpen(false); }} aria-label="Close CRM form">×</button></div>
-                          <p>AI-extracted fields are suggestions. Edit them, check the email or phone for an existing customer, then save the new contact and conversation details.</p>
+                      {promotionOpen && promotionForm && promotionItem && (
+                        <div className="unified-promotion-backdrop" role="presentation">
+                        <form className="unified-promotion-form unified-promotion-dialog" onSubmit={(event) => void submitPromotion(event)} onClick={(event) => event.stopPropagation()}>
+                          <div className="unified-promotion-heading"><strong>Review contact & conversation details</strong><button type="button" onClick={() => { promotionExtractionRun.current += 1; setPromotionExtracting(false); setPromotionOpen(false); }} aria-label="Close CRM form">×</button></div>
+                          <p>{promotionItem.channel} · {promotionItem.title}</p>
+                          <p>Lead classification is an indication only. It does not control whether this contact or conversation can be saved.</p>
+                          <p>Review contact fields below. If this contact already exists (e.g. from LinkedIn or WhatsApp), this conversation will be added to their profile and their record updated.</p>
+                          {classifications[promotionItem.key] && <p className="unified-action-hint">Status: {leadStatusLabel(classifications[promotionItem.key])}</p>}
                           {promotionExtracting && <p className="unified-action-hint" role="status">Extracting relevant lead details…</p>}
-                          {promotionExtractionError && <div className="unified-extraction-error"><p className="unified-action-error" role="alert">{promotionExtractionError}</p><button type="button" className="unified-action-secondary" onClick={() => void extractSelectedLeadDetails(selectedItem, selectedConversationText(selectedItem))} disabled={promotionExtracting}>Retry extraction</button></div>}
+                          {promotionExtractionError && <div className="unified-extraction-error"><p className="unified-action-error" role="alert">{promotionExtractionError}</p><button type="button" className="unified-action-secondary" onClick={() => void extractSelectedLeadDetails(promotionItem, promotionTranscript)} disabled={promotionExtracting}>Retry extraction</button></div>}
                           <div className="unified-promotion-fields">
                             <label>Contact name<input required maxLength={200} value={promotionForm.contact_name ?? ""} onChange={(event) => setPromotionForm({ ...promotionForm, contact_name: event.target.value || null })} /></label>
                             <label>Organisation<input maxLength={180} value={promotionForm.organisation ?? ""} onChange={(event) => setPromotionForm({ ...promotionForm, organisation: event.target.value || null })} /></label>
@@ -1318,8 +1699,8 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
                               promotionDuplicateCheck.email === (promotionForm.email ?? "").trim() &&
                               promotionDuplicateCheck.phone === (promotionForm.phone ?? "").trim() && (
                               promotionDuplicateCheck.matches.length > 0 ? (
-                                <div className="unified-duplicate-result" role="alert">
-                                  <strong>Customer already exists in CRM. This lead cannot be added as a duplicate.</strong>
+                                <div className="unified-duplicate-result" role="status">
+                                  <strong>Customer already exists in CRM. Saving will attach this conversation and update their profile.</strong>
                                   {promotionDuplicateCheck.matches.map((match) => (
                                     <p key={match.id}>
                                       {match.name || "Unnamed contact"}
@@ -1331,13 +1712,15 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
                                   ))}
                                 </div>
                               ) : (
-                                <p className="unified-duplicate-clear" role="status">No existing customer found for this email or phone.</p>
+                                <p className="unified-duplicate-clear" role="status">No existing customer found for this email or phone (new contact will be created).</p>
                               )
                             )}
                             {promotionError && <p className="unified-action-error" role="alert">{promotionError}</p>}
                           </div>
+                          {classifications[promotionItem.key]?.is_lead && <>
+                          <p className="unified-action-hint">Optional opportunity details are AI suggestions. Confirm them before treating them as verified.</p>
                           <div className="unified-promotion-fields">
-                            <label>Lead source<select value={promotionForm.source} onChange={(event) => setPromotionForm({ ...promotionForm, source: event.target.value as LeadSource })}>{(["email", "whatsapp", "linkedin", "instagram", "website", "phone", "other"] as const).map((value) => <option key={value} value={value}>{value.replaceAll("_", " ")}</option>)}</select></label>
+                            <label>Conversation channel<select value={promotionForm.source} onChange={(event) => setPromotionForm({ ...promotionForm, source: event.target.value as LeadSource })}>{(["email", "whatsapp", "linkedin", "instagram", "website", "phone", "other"] as const).map((value) => <option key={value} value={value}>{value.replaceAll("_", " ")}</option>)}</select></label>
                             <label>Service interest<select value={promotionForm.service_interest} onChange={(event) => setPromotionForm({ ...promotionForm, service_interest: event.target.value as LeadExtraction["service_interest"] })}>{(["executive_coaching", "executive_presence", "storytelling_communication", "corporate_training", "leadership_workshop", "keynote_speaking", "event_speaking", "professional_development", "coaching_programme", "other", "unclear"] as const).map((value) => <option key={value} value={value}>{value.replaceAll("_", " ")}</option>)}</select></label>
                             <label>Lead intent<select value={promotionForm.lead_intent} onChange={(event) => setPromotionForm({ ...promotionForm, lead_intent: event.target.value as LeadExtraction["lead_intent"] })}>{(["inquiry", "availability_request", "pricing_request", "proposal_request", "meeting_request", "speaking_request", "training_request", "coaching_request", "partnership", "referral", "other"] as const).map((value) => <option key={value} value={value}>{value.replaceAll("_", " ")}</option>)}</select></label>
                             <label>Event or programme<input maxLength={300} value={promotionForm.event_or_programme ?? ""} onChange={(event) => setPromotionForm({ ...promotionForm, event_or_programme: event.target.value || null })} /></label>
@@ -1354,12 +1737,15 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
                           <label className="unified-promotion-note">Company need<textarea maxLength={600} rows={2} value={promotionForm.company_need ?? ""} onChange={(event) => setPromotionForm({ ...promotionForm, company_need: event.target.value || null })} /></label>
                           <label className="unified-promotion-note">CRM summary<textarea maxLength={1200} rows={3} value={promotionForm.summary} onChange={(event) => setPromotionForm({ ...promotionForm, summary: event.target.value })} /></label>
                           <label className="unified-promotion-note">Qualification notes<textarea maxLength={2000} rows={3} value={promotionForm.qualification_notes ?? ""} onChange={(event) => setPromotionForm({ ...promotionForm, qualification_notes: event.target.value || null })} /></label>
+                          <label className="unified-promotion-verified"><input type="checkbox" checked={promotionDetailsVerified} onChange={(event) => setPromotionDetailsVerified(event.target.checked)} /><span>I reviewed and verified these opportunity details.</span></label>
+                          </>}
                           <label className="unified-promotion-note">Conversation to attach<textarea required maxLength={12000} rows={5} value={promotionNote} onChange={(event) => setPromotionNote(event.target.value)} /></label>
-                          <div className="unified-conversation-action-buttons"><button type="button" className="unified-action-secondary" onClick={() => { promotionExtractionRun.current += 1; setPromotionExtracting(false); setPromotionOpen(false); }}>Cancel</button><button type="submit" className="unified-action-primary" disabled={promotionLoading || promotionExtracting || promotionDuplicateLoading || (promotionDuplicateCheck?.email === (promotionForm.email ?? "").trim() && promotionDuplicateCheck.phone === (promotionForm.phone ?? "").trim() && promotionDuplicateCheck.matches.length > 0) || !promotionNote.trim() || !promotionForm.contact_name?.trim()}>{promotionLoading ? "Saving…" : "Save lead to CRM"}</button></div>
+                          <div className="unified-conversation-action-buttons"><button type="button" className="unified-action-secondary" onClick={() => { promotionExtractionRun.current += 1; setPromotionExtracting(false); setPromotionOpen(false); }}>Cancel</button><button type="submit" className="unified-action-primary" disabled={promotionLoading || promotionExtracting || !promotionNote.trim() || !promotionForm.contact_name?.trim()}>{promotionLoading ? "Saving…" : "Save to CRM"}</button></div>
                         </form>
+                        </div>
                       )}
                     </section>
-                    <footer className="unified-detail-footer"><span>Connected through Unipile</span><span>{selectedItem.channel} <i /> Live account data</span></footer>
+                    <footer className="unified-detail-footer"><span>{selectedItem.channel}</span><span>Live conversation</span></footer>
                   </>
                 ) : (
                   <div className="unified-detail-placeholder"><span>✦</span><strong>Select a conversation</strong><p>Choose a message to view its details.</p></div>
@@ -1386,17 +1772,7 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
             </div>
           </section>
 
-          <details className="unified-developer-tools">
-            <summary>Developer tools <span>Use the generic Unipile API explorer</span></summary>
-            <div className="unified-dev-body">
-              <div className="unified-dev-examples">{apiExamples.map((example) => <button type="button" key={example.label} onClick={() => { setApiMethod(example.method); setApiPath(example.path); }}>{example.label}</button>)}</div>
-              <p>Replace <code>{"{account_id}"}</code> with a connected account ID beginning <code>acc_</code>. Chat messages also need a real chat ID.</p>
-              <div className="unified-dev-controls"><select aria-label="HTTP method" value={apiMethod} onChange={(event) => setApiMethod(event.target.value as ApiMethod)}>{(["GET", "POST", "PUT", "PATCH", "DELETE"] as const).map((method) => <option key={method}>{method}</option>)}</select><input aria-label="Unipile API path" value={apiPath} onChange={(event) => setApiPath(event.target.value)} /><button type="button" onClick={() => void runApiRequest()} disabled={apiLoading}>{apiLoading ? "Running…" : "Run request"}</button></div>
-              {apiMethod !== "GET" && <textarea aria-label="JSON request body" value={apiBody} onChange={(event) => setApiBody(event.target.value)} placeholder={'{\n  "key": "value"\n}'} />}
-              {apiResult && <pre className="unified-api-response"><strong>{apiStatus ?? "Error"}</strong>{apiResult}</pre>}
-            </div>
-          </details>
-          <footer className="unified-footer">A clearer view of every conversation <span>PERSONAL WORKSPACE · POWERED BY UNIPILE</span></footer>
+          <footer className="unified-footer">A clearer view of every conversation</footer>
         </div>
       </section>
     </main>

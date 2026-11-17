@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { acceptedBrowserOrigin } from "@/lib/app-origin";
 import {
   FastApiBridgeError,
   forwardToFastApi,
@@ -22,14 +23,8 @@ const forwardedHeaders = [
 
 async function bridgeRequest(request: NextRequest, context: RouteContext) {
   const origin = request.headers.get("origin");
-  if (origin) {
-    try {
-      if (new URL(origin).origin !== request.nextUrl.origin) {
-        return NextResponse.json({ error: "Request origin was not accepted." }, { status: 403 });
-      }
-    } catch {
-      return NextResponse.json({ error: "Request origin was not accepted." }, { status: 403 });
-    }
+  if (origin && !acceptedBrowserOrigin(origin, request.headers.get("host"))) {
+    return NextResponse.json({ error: "Request origin was not accepted." }, { status: 403 });
   }
   if (!allowedMethods.has(request.method)) {
     return NextResponse.json({ error: "HTTP method is not supported." }, { status: 405 });
@@ -48,8 +43,12 @@ async function bridgeRequest(request: NextRequest, context: RouteContext) {
   const headers = new Headers();
   const accept = request.headers.get("accept");
   const contentType = request.headers.get("content-type");
+  const cookie = request.headers.get("cookie");
+  const authorization = request.headers.get("authorization");
   if (accept) headers.set("Accept", accept);
   if (contentType) headers.set("Content-Type", contentType);
+  if (cookie) headers.set("Cookie", cookie);
+  if (authorization) headers.set("X-User-Authorization", authorization);
 
   try {
     const response = await forwardToFastApi(endpoint, {

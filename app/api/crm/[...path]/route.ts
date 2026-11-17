@@ -1,4 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
+import { acceptedBrowserOrigin } from "@/lib/app-origin";
 import { FastApiBridgeError, forwardToFastApi } from "@/lib/fastapi-bridge";
 
 type RouteContext = {
@@ -10,22 +11,8 @@ const forwardedHeaders = ["content-type", "etag", "last-modified"];
 
 async function bridgeRequest(request: NextRequest, context: RouteContext) {
   const origin = request.headers.get("origin");
-  if (origin) {
-    try {
-      const requestHost = request.headers.get("host")?.toLowerCase();
-      const parsedOrigin = new URL(origin);
-      if (
-        !requestHost ||
-        parsedOrigin.protocol !== "http:" ||
-        parsedOrigin.host.toLowerCase() !== requestHost ||
-        parsedOrigin.username ||
-        parsedOrigin.password
-      ) {
-        return NextResponse.json({ error: "Request origin was not accepted." }, { status: 403 });
-      }
-    } catch {
-      return NextResponse.json({ error: "Request origin was not accepted." }, { status: 403 });
-    }
+  if (origin && !acceptedBrowserOrigin(origin, request.headers.get("host"))) {
+    return NextResponse.json({ error: "Request origin was not accepted." }, { status: 403 });
   }
   if (!allowedMethods.has(request.method)) {
     return NextResponse.json({ error: "HTTP method is not supported." }, { status: 405 });
@@ -42,7 +29,11 @@ async function bridgeRequest(request: NextRequest, context: RouteContext) {
   const endpoint = `/crm/${path.map((segment) => encodeURIComponent(segment)).join("/")}${request.nextUrl.search}`;
   const headers = new Headers();
   const contentType = request.headers.get("content-type");
+  const cookie = request.headers.get("cookie");
+  const authorization = request.headers.get("authorization");
   if (contentType) headers.set("Content-Type", contentType);
+  if (cookie) headers.set("Cookie", cookie);
+  if (authorization) headers.set("X-User-Authorization", authorization);
 
   try {
     const response = await forwardToFastApi(endpoint, {

@@ -1,4 +1,5 @@
 import type { Metadata } from "next";
+import { CsrfFetch } from "@/components/csrf-fetch";
 import "./globals.css";
 
 export const metadata: Metadata = {
@@ -13,7 +14,7 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body><CsrfFetch />{children}</body>
     </html>
   );
 }
