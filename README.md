@@ -60,6 +60,14 @@ Do not commit `.env`. For a new empty database, set `SUPERADMIN_EMAIL` and `SUPE
 
 Supabase starts with a new, empty database; existing SQLite records are not copied automatically. Local development still uses SQLite unless `DATABASE_URL` is set. The Render Blueprint no longer needs a persistent disk when `DATABASE_URL` points to Supabase. Lovable is a hosted app builder and is not the runtime for this Next.js and FastAPI image.
 
+### Deploy with Railway and Supabase
+
+1. Deploy the `railway-deployment` branch from GitHub. Railway detects the root `Dockerfile` automatically.
+2. Add `DATABASE_URL`, `LOCAL_API_TOKEN`, `SUPERADMIN_EMAIL`, and a temporary `SUPERADMIN_INITIAL_PASSWORD` in the Railway service variables. Add `APP_URL` after generating the Railway public domain. Add the Unipile and OpenRouter API keys if you need those features.
+3. Set the service health check path to `/api/health`. On first startup, the app initializes its tables in Supabase.
+
+This branch omits Docker's `VOLUME` instruction because Railway manages persistent storage through service volumes. With Supabase configured, the app does not need a Railway volume. If you choose SQLite instead, attach a Railway volume mounted at `/app/data`; without it, SQLite data is ephemeral.
+
 ## Important boundaries
 
 - Accounts are invite-only. CRM records are scoped by workspace in the configured database (SQLite locally or PostgreSQL when `DATABASE_URL` is set). There is no automated Unipile webhook; inbox sync still runs while the inbox page is open.
