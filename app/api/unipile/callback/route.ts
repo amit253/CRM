@@ -72,13 +72,29 @@ export async function GET(request: NextRequest) {
   if (!expectedState || !receivedState || expectedState !== receivedState) {
     return homeRedirect(request, "failed", { reason: "state" });
   }
-  if (params.has("error_type")) {
-    return homeRedirect(request, "failed", { clearState: true, reason: "provider" });
+  const errorType = params.get("error_type") || "";
+  const duplicateAccount = /(?:^|\/)already_exists$/i.test(errorType);
+  if (errorType && !duplicateAccount) {
+    const normalizedError = errorType.toLowerCase();
+    const reason = normalizedError.includes("account_limit_reached")
+      ? "account-limit"
+      : normalizedError.includes("account_restricted")
+        ? "account-restricted"
+        : "provider";
+    console.error(`Unipile hosted-auth callback returned ${errorType}.`);
+    return homeRedirect(request, "failed", { clearState: true, reason });
   }
 
-  const accountId = params.get("account_id");
+  // Unipile reports a duplicate as error_detail=<existing account ID> after
+  // the provider identity has been authenticated. Verify that account through
+  // the API, then let our workspace ownership check decide whether it can be
+  // attached here.
+  const accountId = params.get("account_id") || (duplicateAccount ? params.get("error_detail") : "");
   if (!accountId || accountId.length > 256) {
-    return homeRedirect(request, "failed", { clearState: true });
+    return homeRedirect(request, "failed", {
+      clearState: true,
+      reason: duplicateAccount ? "already-connected" : "verify",
+    });
   }
 
   try {
@@ -89,7 +105,10 @@ export async function GET(request: NextRequest) {
     );
     if (!accountResponse.ok) {
       console.error(`FastAPI account verification failed with status ${accountResponse.status}.`);
-      return homeRedirect(request, "failed", { clearState: true });
+      return homeRedirect(request, "failed", {
+        clearState: true,
+        reason: duplicateAccount ? "already-connected" : "verify",
+      });
     }
 
     const account: unknown = await accountResponse.json();
@@ -99,7 +118,7 @@ export async function GET(request: NextRequest) {
         : null;
     if (!accountRecord || !("id" in accountRecord) || accountRecord.id !== accountId) {
       console.error("Unipile callback account verification returned an unexpected account.");
-      return homeRedirect(request, "failed", { clearState: true });
+      return homeRedirect(request, "failed", { clearState: true, reason: "verify" });
     }
 
     const registered = await forwardToFastApi("/crm/unipile-accounts", {
@@ -125,7 +144,7 @@ export async function GET(request: NextRequest) {
   } catch (error) {
     if (error instanceof FastApiBridgeError) {
       console.error(`FastAPI account verification failed with status ${error.status}.`);
-      return homeRedirect(request, "failed", { clearState: true });
+      return homeRedirect(request, "failed", { clearState: true, reason: "verify" });
     }
     throw error;
   }
