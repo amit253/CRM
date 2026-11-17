@@ -4,41 +4,25 @@ services:
     runtime: docker
     dockerfilePath: ./Dockerfile
     healthCheckPath: /api/health
-    plan: starter
+    plan: free
     envVars:
       - key: PHIGRAD_ENV
-        value: production
+        value: development # Demo only: invitation links are written to service logs when SMTP is unavailable.
       - key: NODE_ENV
         value: production
       - key: APP_URL
         sync: false
       - key: LOCAL_API_TOKEN
-        sync: false
+        generateValue: true
       - key: UNIPILE_API_KEY
         sync: false
       - key: UNIPILE_API_BASE_URL
-        sync: false
+        value: https://api.unipile.com
       - key: OPENROUTER_API_KEY
         sync: false
       - key: OPENROUTER_MODEL
         value: openai/gpt-4o-mini
       - key: SUPERADMIN_EMAIL
-        sync: false
+        value: amit.kumar@phigrad.ai
       - key: SUPERADMIN_INITIAL_PASSWORD
         sync: false
-      - key: SMTP_HOST
-        sync: false
-      - key: SMTP_PORT
-        value: "587"
-      - key: SMTP_USERNAME
-        sync: false
-      - key: SMTP_PASSWORD
-        sync: false
-      - key: SMTP_FROM
-        sync: false
-      - key: SMTP_USE_TLS
-        value: "true"
-    disk:
-      name: phigrad-data
-      mountPath: /app/data
-      sizeGB: 1
