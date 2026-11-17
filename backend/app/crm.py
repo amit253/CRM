@@ -3,20 +3,21 @@ from __future__ import annotations
 import json
 import os
 import re
-import sqlite3
 import uuid
 from contextlib import contextmanager
 from contextvars import ContextVar, Token
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
-from typing import Annotated, Literal
+from typing import Annotated, Any, Literal, Mapping
 
 import httpx
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.database import DB_INTEGRITY_ERRORS, DatabaseConnection, open_database
+
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
-DATABASE_PATH = Path(os.getenv("CRM_DATABASE_PATH", PROJECT_ROOT / "data" / "phigrad-crm.sqlite3"))
+DATABASE_PATH = Path(os.getenv("CRM_DATABASE_PATH") or PROJECT_ROOT / "data" / "phigrad-crm.sqlite3")
 PIPELINE_STAGES = ("new", "qualified", "proposal", "won", "lost")
 DEFAULT_CLIENT_ID = "default_workspace"
 CLIENT_ID_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
@@ -78,21 +79,11 @@ def normalized_timestamp(value: str | None) -> str:
 
 @contextmanager
 def database():
-    DATABASE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(DATABASE_PATH, timeout=10)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    try:
+    with open_database(DATABASE_PATH) as connection:
         yield connection
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
 
 
-def ensure_client_scope(connection: sqlite3.Connection) -> None:
+def ensure_client_scope(connection: DatabaseConnection) -> None:
     """Add workspace ownership without dropping existing rows.
 
     Existing records stay on default_workspace. Email uniqueness becomes
@@ -206,7 +197,7 @@ def ensure_client_scope(connection: sqlite3.Connection) -> None:
     )
 
 
-def insert_client(connection: sqlite3.Connection, name: str) -> str:
+def insert_client(connection: DatabaseConnection, name: str) -> str:
     client_id = "c_" + uuid.uuid4().hex[:12]
     connection.execute(
         "INSERT INTO clients (id, name, created_at) VALUES (?, ?, ?)",
@@ -215,7 +206,7 @@ def insert_client(connection: sqlite3.Connection, name: str) -> str:
     return client_id
 
 
-def add_membership(connection: sqlite3.Connection, workspace_id: str, user_id: str, role: str = "owner") -> None:
+def add_membership(connection: DatabaseConnection, workspace_id: str, user_id: str, role: str = "owner") -> None:
     if role not in {"owner", "admin", "member"}:
         raise ValueError("Unknown workspace role.")
     connection.execute(
@@ -284,7 +275,7 @@ def initialize_database() -> None:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_companies_name ON companies(name COLLATE NOCASE);
+            CREATE INDEX IF NOT EXISTS idx_companies_name ON companies(lower(name));
 
             CREATE TABLE IF NOT EXISTS contacts (
                 id TEXT PRIMARY KEY,
@@ -301,8 +292,8 @@ def initialize_database() -> None:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
-            CREATE INDEX IF NOT EXISTS idx_contacts_name ON contacts(last_name COLLATE NOCASE, first_name COLLATE NOCASE);
-            CREATE INDEX IF NOT EXISTS idx_contacts_email ON contacts(email COLLATE NOCASE);
+            CREATE INDEX IF NOT EXISTS idx_contacts_name ON contacts(lower(last_name), lower(first_name));
+            CREATE INDEX IF NOT EXISTS idx_contacts_email ON contacts(lower(email));
 
             CREATE TABLE IF NOT EXISTS deals (
                 id TEXT PRIMARY KEY,
@@ -373,9 +364,30 @@ def initialize_database() -> None:
             if name not in activity_columns:
                 connection.execute(f"ALTER TABLE activities ADD COLUMN {name} {definition}")
         ensure_client_scope(connection)
+        if connection.is_postgres:
+            # Supabase's public Data API gets no implicit access to CRM tables.
+            # The server-side database owner can still use them; app authorization stays in FastAPI.
+            for table in (
+                "clients",
+                "client_unipile_accounts",
+                "app_meta",
+                "lead_classifications",
+                "users",
+                "workspace_memberships",
+                "sessions",
+                "email_verifications",
+                "workspace_invitations",
+                "companies",
+                "contacts",
+                "deals",
+                "tasks",
+                "activities",
+                "demo_datasets",
+            ):
+                connection.execute(f"ALTER TABLE {table} ENABLE ROW LEVEL SECURITY")
 
 
-def as_dict(row: sqlite3.Row) -> dict:
+def as_dict(row: Mapping[str, Any]) -> dict:
     result = dict(row)
     if "tags" in result:
         result["tags"] = json.loads(result["tags"])
@@ -386,7 +398,7 @@ def as_dict(row: sqlite3.Row) -> dict:
     return result
 
 
-def row_or_404(connection: sqlite3.Connection, table: str, record_id: str) -> sqlite3.Row:
+def row_or_404(connection: DatabaseConnection, table: str, record_id: str) -> Mapping[str, Any]:
     if table not in {"contacts", "companies", "deals", "tasks"}:
         raise RuntimeError("Unsupported CRM resource.")
     row = connection.execute(
@@ -398,8 +410,8 @@ def row_or_404(connection: sqlite3.Connection, table: str, record_id: str) -> sq
     return row
 
 
-def raise_database_error(error: sqlite3.IntegrityError) -> None:
-    message = str(error)
+def raise_database_error(error: Exception) -> None:
+    message = str(error).upper()
     if "FOREIGN KEY" in message:
         raise HTTPException(status_code=400, detail="A selected contact, company, or deal no longer exists.") from error
     if "UNIQUE" in message:
@@ -413,7 +425,7 @@ def reject_null_fields(values: dict, nullable: set[str]) -> None:
         raise HTTPException(status_code=422, detail=f"These fields cannot be null: {', '.join(invalid)}.")
 
 
-def demo_dataset_result(connection: sqlite3.Connection) -> dict:
+def demo_dataset_result(connection: DatabaseConnection) -> dict:
     dataset = connection.execute(
         "SELECT created_at, company_ids, contact_ids, deal_ids, task_ids FROM demo_datasets WHERE dataset_id = ?",
         (demo_dataset_id(),),
@@ -421,9 +433,9 @@ def demo_dataset_result(connection: sqlite3.Connection) -> dict:
     if dataset is None:
         counts = {
             table: connection.execute(
-                f"SELECT COUNT(*) FROM {table} WHERE client_id = ?",
+                f"SELECT COUNT(*) AS count FROM {table} WHERE client_id = ?",
                 (client_scope(),),
-            ).fetchone()[0]
+            ).fetchone()["count"]
             for table in ("companies", "contacts", "deals", "tasks", "activities")
         }
         return {"loaded": False, "empty": not any(counts.values())}
@@ -458,9 +470,9 @@ def load_demo_data():
 
         counts = {
             table: connection.execute(
-                f"SELECT COUNT(*) FROM {table} WHERE client_id = ?",
+                f"SELECT COUNT(*) AS count FROM {table} WHERE client_id = ?",
                 (client_scope(),),
-            ).fetchone()[0]
+            ).fetchone()["count"]
             for table in ("companies", "contacts", "deals", "tasks", "activities")
         }
         if any(counts.values()):
@@ -787,7 +799,7 @@ def normalized_phone(value: str) -> str:
 
 
 def find_duplicate_contacts(
-    connection: sqlite3.Connection,
+    connection: DatabaseConnection,
     email: str,
     phone: str,
 ) -> list[dict]:
@@ -810,7 +822,7 @@ def find_duplicate_contacts(
         FROM contacts c
         LEFT JOIN companies co ON co.id = c.company_id AND co.client_id = c.client_id
         WHERE c.client_id = ? AND ({" OR ".join(conditions)})
-        ORDER BY c.last_name COLLATE NOCASE, c.first_name COLLATE NOCASE
+        ORDER BY lower(c.last_name), lower(c.first_name)
         """,
         [client_scope(), *parameters],
     ).fetchall()
@@ -914,7 +926,7 @@ def list_contacts(
     params: list[str] = [client_scope()]
     if search.strip():
         term = f"%{search.strip()}%"
-        query += " AND (c.first_name LIKE ? OR c.last_name LIKE ? OR c.email LIKE ? OR co.name LIKE ?)"
+        query += " AND (lower(c.first_name) LIKE lower(?) OR lower(c.last_name) LIKE lower(?) OR lower(c.email) LIKE lower(?) OR lower(co.name) LIKE lower(?))"
         params.extend([term, term, term, term])
     if status:
         query += " AND c.status = ?"
@@ -940,7 +952,7 @@ def create_contact(payload: ContactCreate):
                 """,
                 {"id": record_id, **values, "created_at": timestamp, "updated_at": timestamp, "client_id": client_scope()},
             )
-        except sqlite3.IntegrityError as error:
+        except DB_INTEGRITY_ERRORS as error:
             raise_database_error(error)
         return as_dict(row_or_404(connection, "contacts", record_id))
 
@@ -1001,7 +1013,7 @@ def update_contact(contact_id: str, payload: ContactUpdate):
                 f"UPDATE contacts SET {assignments}, updated_at = ? WHERE id = ? AND client_id = ?",
                 [*values.values(), utc_now(), contact_id, client_scope()],
             )
-        except sqlite3.IntegrityError as error:
+        except DB_INTEGRITY_ERRORS as error:
             raise_database_error(error)
         return as_dict(row_or_404(connection, "contacts", contact_id))
 
@@ -1148,7 +1160,7 @@ def promote_inbox_conversation(payload: InboxPromotionCreate):
 
         if company_name:
             company = connection.execute(
-                "SELECT id FROM companies WHERE name = ? COLLATE NOCASE AND client_id = ? LIMIT 1",
+                "SELECT id FROM companies WHERE lower(name) = lower(?) AND client_id = ? LIMIT 1",
                 (company_name, client),
             ).fetchone()
             if company:
@@ -1320,9 +1332,9 @@ def find_matching_contact(payload: ContactMatchRequest):
                 FROM contacts
                 WHERE client_id = ?
                   AND (
-                    (first_name || ' ' || last_name) = ? COLLATE NOCASE
-                    OR first_name = ? COLLATE NOCASE
-                    OR last_name = ? COLLATE NOCASE
+                    lower(first_name || ' ' || last_name) = lower(?)
+                    OR lower(first_name) = lower(?)
+                    OR lower(last_name) = lower(?)
                   )
                 LIMIT 1
                 """,
@@ -1555,8 +1567,8 @@ def list_companies(search: Annotated[str, Query(max_length=120)] = ""):
                     (SELECT COUNT(*) FROM contacts c WHERE c.company_id = co.id AND c.archived = 0 AND c.client_id = co.client_id) AS contact_count,
                     (SELECT COUNT(*) FROM deals d WHERE d.company_id = co.id AND d.stage NOT IN ('won', 'lost') AND d.client_id = co.client_id) AS open_deals
                 FROM companies co
-                WHERE co.client_id = ? AND (? = '' OR co.name LIKE ? OR co.domain LIKE ? OR co.industry LIKE ?)
-                ORDER BY co.name COLLATE NOCASE LIMIT 500
+                WHERE co.client_id = ? AND (? = '' OR lower(co.name) LIKE lower(?) OR lower(co.domain) LIKE lower(?) OR lower(co.industry) LIKE lower(?))
+                ORDER BY lower(co.name) LIMIT 500
                 """,
                 (client_scope(), search.strip(), term, term, term),
             ).fetchall()
@@ -1626,7 +1638,7 @@ def create_deal(payload: DealCreate):
                 """,
                 {"id": record_id, **values, "created_at": timestamp, "updated_at": timestamp, "client_id": client_scope()},
             )
-        except sqlite3.IntegrityError as error:
+        except DB_INTEGRITY_ERRORS as error:
             raise_database_error(error)
         return dict(row_or_404(connection, "deals", record_id))
 
@@ -1645,7 +1657,7 @@ def update_deal(deal_id: str, payload: DealUpdate):
                 f"UPDATE deals SET {assignments}, updated_at = ? WHERE id = ? AND client_id = ?",
                 [*values.values(), utc_now(), deal_id, client_scope()],
             )
-        except sqlite3.IntegrityError as error:
+        except DB_INTEGRITY_ERRORS as error:
             raise_database_error(error)
         return dict(row_or_404(connection, "deals", deal_id))
 
@@ -1682,7 +1694,7 @@ def create_task(payload: TaskCreate):
                 """,
                 {"id": record_id, **values, "created_at": timestamp, "updated_at": timestamp, "client_id": client_scope()},
             )
-        except sqlite3.IntegrityError as error:
+        except DB_INTEGRITY_ERRORS as error:
             raise_database_error(error)
         return as_dict(row_or_404(connection, "tasks", record_id))
 
@@ -1703,7 +1715,7 @@ def update_task(task_id: str, payload: TaskUpdate):
                 f"UPDATE tasks SET {assignments}, updated_at = ? WHERE id = ? AND client_id = ?",
                 [*values.values(), utc_now(), task_id, client_scope()],
             )
-        except sqlite3.IntegrityError as error:
+        except DB_INTEGRITY_ERRORS as error:
             raise_database_error(error)
         return as_dict(row_or_404(connection, "tasks", task_id))
 
@@ -1909,7 +1921,8 @@ def filter_unipile_accounts(account_ids: list[str]) -> set[str]:
                     (DEFAULT_CLIENT_ID, account_id, now, account_id),
                 )
             connection.execute(
-                "INSERT OR REPLACE INTO app_meta (key, value) VALUES ('default_unipile_claimed', ?)",
+                "INSERT INTO app_meta (key, value) VALUES ('default_unipile_claimed', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (now,),
             )
         rows = connection.execute(

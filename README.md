@@ -36,13 +36,13 @@ The Next.js server forwards app requests to FastAPI. FastAPI injects the Unipile
 - **Unified inbox:** `/inbox` reads supported email/chat data from connected Unipile accounts, labels conversations by provider, and checks for new messages about once a minute while the page is open. Newly observed inbound messages are classified by Anand-specific lead rules using OpenRouter; available chat history is included as context. A message classified as a lead at 40% confidence or higher is automatically sent for a second extraction request using the conversation and available sender metadata. Lead status and extracted details are shown in the inbox. Older conversations are classified only when requested, and extraction remains part of the manual **Add to CRM** flow. Before saving, users can check the edited email or phone against CRM contacts. Matching is case-insensitive for email and ignores phone formatting; a match blocks creating a contact, company, or lead note.
 - The development API retains a sample-data endpoint for local testing, but the CRM UI does not display sample-data controls or labels.
 
-CRM records are persisted in `data/phigrad-crm.sqlite3`, which is ignored by Git. Back up this file if you need to preserve local CRM data.
+Local CRM records are persisted in `data/phigrad-crm.sqlite3`, which is ignored by Git. When `DATABASE_URL` is set, the backend uses PostgreSQL instead; local SQLite remains the fallback when it is unset.
 
-The overview numbers are calculated from this local CRM database: **Contacts** counts non-archived contact rows; **Companies** counts company rows; **Open sales pipeline** counts sales not in Won or Lost; **Follow-ups** counts incomplete tasks, with the smaller number counting incomplete tasks whose due date is today or earlier. Stage totals include the number of sales in each stage, not their currency values. These figures do not read Gmail, Unipile conversations, or inbox messages.
+The overview numbers are calculated from the configured CRM database: **Contacts** counts non-archived contact rows; **Companies** counts company rows; **Open sales pipeline** counts sales not in Won or Lost; **Follow-ups** counts incomplete tasks, with the smaller number counting incomplete tasks whose due date is today or earlier. Stage totals include the number of sales in each stage, not their currency values. These figures do not read Gmail, Unipile conversations, or inbox messages.
 
 ## Deploy with Docker
 
-The production image runs Next.js on port `$PORT` and FastAPI only on `127.0.0.1:8001` inside the same container. The browser never calls FastAPI directly. SQLite is stored at `/app/data/phigrad-crm.sqlite3`.
+The production image runs Next.js on port `$PORT` and FastAPI only on `127.0.0.1:8001` inside the same container. The browser never calls FastAPI directly. Without `DATABASE_URL`, SQLite is stored at `/app/data/phigrad-crm.sqlite3`.
 
 ```powershell
 docker build -t phigrad .
@@ -51,12 +51,19 @@ docker run --rm -p 3000:3000 --env-file .env -e PHIGRAD_ENV=production -e NODE_E
 
 Do not commit `.env`. For a new empty database, set `SUPERADMIN_EMAIL` and `SUPERADMIN_INITIAL_PASSWORD`, sign in once, then remove the initial password. Set `APP_URL` to the public `https` origin and register `https://<your-host>/api/unipile/callback` with Unipile.
 
-Render can use `render.yaml`. Connect the GitHub repository, fill the secret environment variables, and attach the `/app/data` disk. Without that disk, a redeploy starts from an empty database. Lovable is a hosted app builder and is not the runtime for this Next.js and FastAPI image.
+### Use Supabase Postgres on Render
+
+1. In the Supabase project, click **Connect** and copy the **Session pooler** connection string, which Supabase documents as IPv4-compatible. Keep the password encoded in the connection string if it contains reserved URL characters.
+2. In the Render service environment, set `DATABASE_URL` to that connection string. For an existing Blueprint service, add it manually under **Environment**; Render does not add new `sync: false` variables when syncing Blueprint updates. Keep it server-side; do not use it in a `NEXT_PUBLIC_` variable or browser code.
+3. Redeploy. On startup, FastAPI creates the app tables and enables Row Level Security on them. The app connects server-side and performs its own workspace authorization; its tables have no public Supabase Data API policies.
+4. The first empty Supabase database bootstraps `SUPERADMIN_EMAIL` using `SUPERADMIN_INITIAL_PASSWORD`. Sign in, then remove the initial password from Render.
+
+Supabase starts with a new, empty database; existing SQLite records are not copied automatically. Local development still uses SQLite unless `DATABASE_URL` is set. The Render Blueprint no longer needs a persistent disk when `DATABASE_URL` points to Supabase. Lovable is a hosted app builder and is not the runtime for this Next.js and FastAPI image.
 
 ## Important boundaries
 
-- Accounts are invite-only. Each customer workspace is isolated in SQLite. There is no hosted database or automated Unipile webhook; inbox sync still runs while the inbox page is open.
-- CRM contacts, companies, sales, tasks, notes, dashboard counts, and demo records come from the local SQLite database. Connecting Gmail or another Unipile account does not import it into CRM; the inbox and CRM are separate.
+- Accounts are invite-only. CRM records are scoped by workspace in the configured database (SQLite locally or PostgreSQL when `DATABASE_URL` is set). There is no automated Unipile webhook; inbox sync still runs while the inbox page is open.
+- CRM contacts, companies, sales, tasks, notes, dashboard counts, and demo records come from the configured database. Connecting Gmail or another Unipile account does not import it into CRM; the inbox and CRM are separate.
 - The app does not automatically import messages into CRM records. Classification and extraction do not create CRM records. Use **Add to CRM** on a conversation classified as a lead to review and edit the extracted contact/opportunity fields, optionally check for an existing contact, then manually save a contact, an optional company, and a structured lead note. The server checks again during save and blocks the whole promotion if the email or phone already exists. Sales are never created by this action.
 - Provider API availability and granted permissions determine which inbox data is available. Review provider permissions if an inbox cannot sync.
 - Automatic inbox lead classification sends newly observed inbound conversation text (at most 12,000 characters per request) to OpenRouter about once a minute while `/inbox` is open. If classified as a lead with confidence >= 0.40, a second automatic request sends the same conversation text and available sender name/email/phone metadata for detail extraction. The inbox displays the lead result and whether extraction succeeded. The first inbox sync seeds current messages as existing and does not submit that backlog. Earlier conversations remain opt-in through **Classify as lead**, followed by detail extraction from **Add to CRM**. Classification and extraction results are cached in browser local storage (including extracted contact details) to support the inbox display and avoid unnecessary repeat analysis. Do not use shared browser profiles for sensitive inboxes. Neither classification nor extraction changes CRM records until the user reviews and saves. OpenRouter/model-provider data handling and retention still apply. Never commit `.env`.
@@ -72,7 +79,7 @@ Run `npm run lint`, `npm run typecheck`, and `npm run build`.
 
 ## FastAPI APIs
 
-CRM endpoints are under `/crm/...` and use the local authenticated FastAPI service and SQLite database. The inbox reads connected accounts, email lists, chat lists, and individual chat message lists. The generic API explorer supports published Unipile paths under `/v1/...` and `/v2/...`; it does not hand-write a wrapper for every provider endpoint. Check Unipile's reference docs for exact schemas, provider-specific availability, permissions, and required fields.
+CRM endpoints are under `/crm/...` and use the local authenticated FastAPI service and configured database. The inbox reads connected accounts, email lists, chat lists, and individual chat message lists. The generic API explorer supports published Unipile paths under `/v1/...` and `/v2/...`; it does not hand-write a wrapper for every provider endpoint. Check Unipile's reference docs for exact schemas, provider-specific availability, permissions, and required fields.
 
 `POST /crm/contacts/check-duplicate` accepts an email and/or phone and returns matching CRM contacts. Email matching is case-insensitive; phone matching compares digits only. Inbox promotion also performs this check atomically and returns HTTP 409 without writing a company, contact, or note when a duplicate is found.
 

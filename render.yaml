@@ -12,6 +12,8 @@ services:
         value: production
       - key: APP_URL
         sync: false
+      - key: DATABASE_URL
+        sync: false
       - key: LOCAL_API_TOKEN
         generateValue: true
       - key: UNIPILE_API_KEY

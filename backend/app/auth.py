@@ -129,7 +129,7 @@ def bootstrap_superadmin() -> None:
     with database() as connection:
         row = connection.execute("SELECT id, is_superadmin FROM users WHERE email = ?", (configured,)).fetchone()
         if row is None:
-            user_count = connection.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+            user_count = connection.execute("SELECT COUNT(*) AS count FROM users").fetchone()["count"]
             initial_password = os.getenv("SUPERADMIN_INITIAL_PASSWORD", "")
             if user_count == 0 and len(initial_password.encode()) >= 8 and len(initial_password.encode()) <= 72:
                 user_id = str(uuid.uuid4())

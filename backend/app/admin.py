@@ -35,8 +35,8 @@ def require_superadmin() -> str:
 
 def active_superadmin_count(connection) -> int:
     return connection.execute(
-        "SELECT COUNT(*) FROM users WHERE is_superadmin = 1 AND is_suspended = 0"
-    ).fetchone()[0]
+        "SELECT COUNT(*) AS count FROM users WHERE is_superadmin = 1 AND is_suspended = 0"
+    ).fetchone()["count"]
 
 
 @router.get("/users")
@@ -54,7 +54,7 @@ def list_users():
             SELECT m.user_id, c.id AS workspace_id, c.name AS workspace_name, m.role
             FROM workspace_memberships m
             JOIN clients c ON c.id = m.workspace_id
-            ORDER BY c.name COLLATE NOCASE
+            ORDER BY lower(c.name)
             """
         ).fetchall()
     grouped: dict[str, list[dict]] = {}
