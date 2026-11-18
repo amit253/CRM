@@ -1503,6 +1503,14 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
             <div><span className="unified-eyebrow">YOUR COMMUNICATION HUB</span><h1>Unified inbox</h1><p>Stay on top of conversations across every connected channel.</p></div>
             <button type="button" className="unified-refresh" onClick={() => void loadInbox(true)} disabled={loading}>{loading ? "Syncing…" : "↻  Refresh inbox"}</button>
           </div>
+          <section className="unified-connect-panel" id="connect-channel" aria-labelledby="unified-connect-title">
+            <div className="unified-connect-copy"><strong id="unified-connect-title">Connect a channel</strong><span>Choose a provider to securely connect an account to this workspace.</span></div>
+            <div className="unified-connect-control">
+              <label><span className="sr-only">Choose provider</span><select value={selectedProvider} onChange={(event) => setSelectedProvider(event.target.value as Provider)}>{providers.map((provider) => <option value={provider.id} key={provider.id}>{provider.name}</option>)}</select></label>
+              <button type="button" onClick={() => void connectAccount()} disabled={connecting}>{connecting ? "Opening secure sign-in…" : "＋ Connect account"}</button>
+            </div>
+            {connectError && <div className="unified-error" role="alert"><strong>Could not connect account</strong><span>{connectError}</span></div>}
+          </section>
           <div className={`unified-ai-status ${aiConfigured ? "ready" : ""}`} role="status">{aiConfigured ? "✦ AI Ready" : "AI unavailable"}</div>
           {automaticAnalysisError && <div className="unified-error" role="status"><strong>AI classification needs attention</strong><span>{automaticAnalysisError}</span></div>}
           <section className="unified-inbox-card" aria-label="Unified inbox">
@@ -1527,7 +1535,7 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
                 <div className="unified-list-heading"><span>{loading ? "Syncing conversations…" : `${filteredItems.length} conversations`}</span><button type="button" onClick={() => void loadInbox(true)} aria-label="Refresh conversations">↻</button></div>
                 <div className="unified-conversation-list">
                   {!loading && filteredItems.length === 0 && (
-                    <div className="unified-empty"><span className="unified-empty-icon">▤</span><strong>{accounts.length ? "No conversations found" : "Connect your first channel"}</strong><p>{accounts.length ? "Try another channel filter or check the account permissions." : "Connect Gmail, LinkedIn, Instagram, or another supported provider to see real conversations here."}</p><a href="#accounts">{accounts.length ? "Manage connected accounts" : "Connect an account"} <span>→</span></a></div>
+                    <div className="unified-empty"><span className="unified-empty-icon">▤</span><strong>{accounts.length ? "No conversations found" : "Connect your first channel"}</strong><p>{accounts.length ? "Try another channel filter or check the account permissions." : "Connect Gmail, LinkedIn, Instagram, or another supported provider to see real conversations here."}</p><a href={accounts.length ? "#accounts" : "#connect-channel"}>{accounts.length ? "Manage connected accounts" : "Connect an account"} <span>→</span></a></div>
                   )}
                   {filteredItems.map((item) => (
                     <div
@@ -1755,11 +1763,7 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
           </section>
 
           <section className="unified-accounts-section" id="accounts">
-            <div className="unified-section-heading"><div><span className="unified-eyebrow">CHANNELS</span><h2>Connected accounts</h2><p>Connect the inboxes you want to bring together.</p></div><div className="unified-connect-control">
-              <label><span className="sr-only">Choose provider</span><select value={selectedProvider} onChange={(event) => setSelectedProvider(event.target.value as Provider)}>{providers.map((provider) => <option value={provider.id} key={provider.id}>{provider.name}</option>)}</select></label>
-              <button type="button" onClick={() => void connectAccount()} disabled={connecting}>{connecting ? "Opening secure sign-in…" : "＋ Connect account"}</button>
-            </div></div>
-            {connectError && <div className="unified-error" role="alert"><strong>Could not connect account</strong><span>{connectError}</span></div>}
+            <div className="unified-section-heading"><div><span className="unified-eyebrow">CHANNELS</span><h2>Connected accounts</h2><p>Accounts connected to this workspace.</p></div></div>
             <div className="unified-account-grid">
               {accounts.map((account) => (
                 <article className="unified-account-card" key={account.id}>
@@ -1768,7 +1772,7 @@ export default function UnifiedInbox({ apiConfigured, aiConfigured, connection, 
                   <i className={account.status === "running" ? "connected" : ""} title={account.status} />
                 </article>
               ))}
-              {!accounts.length && !loading && <div className="unified-no-accounts">No accounts connected yet. Choose a provider above to get started.</div>}
+              {!accounts.length && !loading && <div className="unified-no-accounts">No accounts connected yet. Choose a provider in the connect panel above to get started.</div>}
             </div>
           </section>
 
