@@ -92,7 +92,7 @@ def user_from_session(raw_token: str):
     if not raw_token:
         return None
     with database() as connection:
-        row = connection.execute(
+        user = connection.execute(
             """
             SELECT u.id, u.email, u.full_name, u.is_verified, u.is_superadmin, u.is_suspended, s.expires_at
             FROM sessions s
@@ -101,11 +101,38 @@ def user_from_session(raw_token: str):
             """,
             (hash_secret(raw_token),),
         ).fetchone()
-    if row is None:
+    if user is None or user["expires_at"] < utc_now():
         return None
-    if row["expires_at"] < utc_now():
-        return None
-    return row
+    return user
+
+
+def user_and_workspaces_from_session(raw_token: str):
+    """Load an authenticated user and memberships in one database session."""
+    if not raw_token:
+        return None, []
+    with database() as connection:
+        user = connection.execute(
+            """
+            SELECT u.id, u.email, u.full_name, u.is_verified, u.is_superadmin, u.is_suspended, s.expires_at
+            FROM sessions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.token_hash = ?
+            """,
+            (hash_secret(raw_token),),
+        ).fetchone()
+        if user is None or user["expires_at"] < utc_now():
+            return None, []
+        memberships = connection.execute(
+            """
+            SELECT c.id, c.name, c.created_at, m.role
+            FROM workspace_memberships m
+            JOIN clients c ON c.id = m.workspace_id
+            WHERE m.user_id = ?
+            ORDER BY CASE WHEN c.id = ? THEN 1 ELSE 0 END, c.created_at
+            """,
+            (user["id"], DEFAULT_CLIENT_ID),
+        ).fetchall()
+    return user, [dict(row) for row in memberships]
 
 
 def preferred_workspace(user_id: str) -> dict | None:

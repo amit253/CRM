@@ -11,6 +11,26 @@ export class FastApiBridgeError extends Error {
   }
 }
 
+function logBridgeFailure(path: string, error: unknown) {
+  const errorObject =
+    typeof error === "object" && error !== null
+      ? (error as { name?: unknown; cause?: unknown })
+      : undefined;
+  const cause = errorObject?.cause;
+  const causeCode =
+    typeof cause === "object" && cause !== null && "code" in cause &&
+    typeof cause.code === "string"
+      ? cause.code
+      : undefined;
+
+  console.error("FastAPI bridge request failed", {
+    path: path.split("?", 1)[0],
+    errorName:
+      typeof errorObject?.name === "string" ? errorObject.name : "UnknownError",
+    causeCode,
+  });
+}
+
 function getBridgeConfig() {
   const token = process.env.LOCAL_API_TOKEN;
   if (!token) {
@@ -84,10 +104,18 @@ export async function forwardToFastApi(
       cache: "no-store",
       signal: AbortSignal.timeout(35_000),
     });
-  } catch {
+  } catch (error) {
+    logBridgeFailure(normalizedPath, error);
+    const errorName =
+      typeof error === "object" && error !== null && "name" in error
+        ? error.name
+        : undefined;
+    const timedOut = errorName === "TimeoutError";
     throw new FastApiBridgeError(
-      "FastAPI backend service is unavailable. Please try again.",
-      502,
+      timedOut
+        ? "FastAPI request timed out. Please try again."
+        : "FastAPI backend service is unavailable. Please try again.",
+      timedOut ? 504 : 502,
     );
   }
 }

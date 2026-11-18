@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import json
+import logging
 import os
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -12,13 +13,20 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request, Security
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from starlette.concurrency import run_in_threadpool
 from starlette.background import BackgroundTask
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(PROJECT_ROOT / ".env")
 
 from app.admin import router as admin_router
-from app.auth import bootstrap_superadmin, read_session_token, revoke_sessions, router as auth_router, user_from_session
+from app.auth import (
+    bootstrap_superadmin,
+    read_session_token,
+    revoke_sessions,
+    router as auth_router,
+    user_and_workspaces_from_session,
+)
 from app.invitations import router as invitation_router
 from app.crm import (
     bind_client,
@@ -31,9 +39,8 @@ from app.crm import (
     router as crm_router,
     unipile_account_allowed,
     valid_client_id,
-    workspace_memberships,
-    workspace_role,
 )
+from app.database import close_database_pool
 
 LOCAL_HOSTS = {"localhost:8001", "127.0.0.1:8001"}
 LOCAL_ORIGINS = {
@@ -76,6 +83,17 @@ LOCAL_DOCUMENTATION_PATHS = {"/docs", "/docs/oauth2-redirect", "/openapi.json", 
 PUBLIC_PATHS = {"/health", "/auth/register", "/auth/login", "/auth/verify", "/auth/invitation"}
 SESSION_ONLY_PATHS = {"/auth/me", "/auth/logout", "/crm/clients"}
 bearer_scheme = HTTPBearer(auto_error=False)
+logger = logging.getLogger(__name__)
+
+
+def revoke_user_sessions(user_id: str) -> None:
+    with database() as connection:
+        revoke_sessions(connection, user_id)
+
+
+def check_database() -> None:
+    with database() as connection:
+        connection.execute("SELECT 1").fetchone()
 
 
 def unipile_base_url() -> str:
@@ -100,11 +118,14 @@ def unipile_base_url() -> str:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    initialize_database()
-    bootstrap_superadmin()
-    async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as client:
-        app.state.unipile_client = client
-        yield
+    try:
+        initialize_database()
+        bootstrap_superadmin()
+        async with httpx.AsyncClient(timeout=httpx.Timeout(30.0, connect=10.0)) as client:
+            app.state.unipile_client = client
+            yield
+    finally:
+        close_database_pool()
 
 
 app = FastAPI(
@@ -161,12 +182,14 @@ async def enforce_local_access(request: Request, call_next):
         request.headers.get("cookie", ""),
         request.headers.get("x-user-authorization", ""),
     )
-    user = user_from_session(session_token)
+    user, memberships = await run_in_threadpool(
+        user_and_workspaces_from_session,
+        session_token,
+    )
     if user is None:
         return JSONResponse({"detail": "Sign in required."}, status_code=401)
     if user["is_suspended"]:
-        with database() as connection:
-            revoke_sessions(connection, user["id"])
+        await run_in_threadpool(revoke_user_sessions, user["id"])
         return JSONResponse(
             {"detail": "Your account has been suspended. Please contact support."},
             status_code=403,
@@ -176,8 +199,8 @@ async def enforce_local_access(request: Request, call_next):
     if request.url.path.startswith("/admin") and not user["is_superadmin"]:
         return JSONResponse({"detail": "Platform admin access is required."}, status_code=403)
 
-    memberships = workspace_memberships(user["id"])
-    allowed = {item["id"] for item in memberships}
+    membership_roles = {item["id"]: item["role"] for item in memberships}
+    allowed = set(membership_roles)
     if request.url.path.startswith("/admin"):
         user_token = bind_user(user["id"])
         client_token = bind_client(memberships[0]["id"] if memberships else "")
@@ -196,7 +219,7 @@ async def enforce_local_access(request: Request, call_next):
         active_client = requested_client
     else:
         active_client = memberships[0]["id"]
-    if not valid_client_id(active_client) or workspace_role(user["id"], active_client) is None:
+    if not valid_client_id(active_client) or active_client not in membership_roles:
         return JSONResponse({"detail": "You do not have access to that workspace."}, status_code=403)
 
     user_token = bind_user(user["id"])
@@ -210,8 +233,21 @@ async def enforce_local_access(request: Request, call_next):
 
 @app.get("/health", include_in_schema=False)
 async def health():
+    try:
+        await run_in_threadpool(check_database)
+    except Exception as error:
+        logger.warning(
+            "FastAPI readiness check failed: error_type=%s sqlstate=%s",
+            type(error).__name__,
+            getattr(error, "sqlstate", None),
+        )
+        return JSONResponse(
+            {"status": "unavailable", "database": "unavailable"},
+            status_code=503,
+        )
     return {
         "status": "ok",
+        "database": "ok",
         "unipile_api_key_configured": bool(
             os.getenv("UNIPILE_API_KEY") or os.getenv("Unipile_Api_Key")
         ),
@@ -272,8 +308,10 @@ async def proxy_unipile(
         raise HTTPException(status_code=404, detail="This inbox path is not available for the active workspace.")
     if endpoint_path == "accounts" and request.method != "GET":
         raise HTTPException(status_code=404, detail="This inbox path is not available for the active workspace.")
-    if account_id and not claiming_new_account and not unipile_account_allowed(account_id):
-        raise HTTPException(status_code=404, detail="That connected account is not in this workspace.")
+    if account_id and not claiming_new_account:
+        account_allowed = await run_in_threadpool(unipile_account_allowed, account_id)
+        if not account_allowed:
+            raise HTTPException(status_code=404, detail="That connected account is not in this workspace.")
 
     encoded_path = "/".join(quote(segment, safe="-._~:@!$&'()*+,;=%") for segment in segments)
     upstream_url = f"{unipile_base_url()}/{version}/{encoded_path}"
@@ -318,7 +356,7 @@ async def proxy_unipile(
                 for item in items
                 if isinstance(item, dict) and isinstance(item.get("id"), str)
             ]
-            allowed = filter_unipile_accounts(ids)
+            allowed = await run_in_threadpool(filter_unipile_accounts, ids)
             payload["data"] = [
                 item for item in items
                 if isinstance(item, dict) and item.get("id") in allowed
