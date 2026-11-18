@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterable, Iterator, Mapping
@@ -18,11 +19,21 @@ except ImportError:  # Local SQLite development can run without the Postgres dri
     conninfo_to_dict = None
     dict_row = None
 
+try:
+    from psycopg_pool import ConnectionPool
+except ImportError:  # SQLite-only local development can run without the pool package.
+    ConnectionPool = None
+
 
 if psycopg is None:
     DB_INTEGRITY_ERRORS = (sqlite3.IntegrityError,)
 else:
     DB_INTEGRITY_ERRORS = (sqlite3.IntegrityError, psycopg.IntegrityError)
+
+
+_postgres_pool: Any = None
+_postgres_pool_url = ""
+_postgres_pool_lock = threading.Lock()
 
 
 def _replace_qmark_placeholders(query: str) -> str:
@@ -125,16 +136,12 @@ def open_database(sqlite_path: Path) -> Iterator[DatabaseConnection]:
     if database_url:
         if psycopg is None or conninfo_to_dict is None or dict_row is None:
             raise RuntimeError("DATABASE_URL is set, but the psycopg driver is not installed.")
-        connection_info = conninfo_to_dict(database_url)
-        if not connection_info.get("sslmode"):
-            connection_info["sslmode"] = "require"
-        raw_connection = psycopg.connect(
-            **connection_info,
-            connect_timeout=10,
-            prepare_threshold=None,
-            row_factory=dict_row,
-        )
-        connection = DatabaseConnection(raw_connection, is_postgres=True)
+        pool = _get_postgres_pool(database_url)
+        pool_timeout = float(os.getenv("DATABASE_POOL_TIMEOUT", "8"))
+        with pool.connection(timeout=pool_timeout) as raw_connection:
+            connection = DatabaseConnection(raw_connection, is_postgres=True)
+            yield connection
+        return
     else:
         sqlite_path.parent.mkdir(parents=True, exist_ok=True)
         raw_connection = sqlite3.connect(sqlite_path, timeout=10)
@@ -151,3 +158,66 @@ def open_database(sqlite_path: Path) -> Iterator[DatabaseConnection]:
         raise
     finally:
         connection.close()
+
+
+def _get_postgres_pool(database_url: str):
+    global _postgres_pool, _postgres_pool_url
+
+    if ConnectionPool is None or conninfo_to_dict is None or dict_row is None:
+        raise RuntimeError("DATABASE_URL is set, but psycopg_pool is not installed.")
+
+    with _postgres_pool_lock:
+        if _postgres_pool is not None and _postgres_pool_url == database_url:
+            return _postgres_pool
+
+        if _postgres_pool is not None:
+            _postgres_pool.close()
+            _postgres_pool = None
+            _postgres_pool_url = ""
+
+        connection_info = conninfo_to_dict(database_url)
+        if not connection_info.get("sslmode"):
+            connection_info["sslmode"] = "require"
+        connection_info["connect_timeout"] = 10
+        connection_info["prepare_threshold"] = None
+        connection_info["row_factory"] = dict_row
+        configured_options = connection_info.get("options", "").strip()
+        connection_info["options"] = " ".join(
+            option
+            for option in (
+                configured_options,
+                "-c statement_timeout=12000",
+                "-c lock_timeout=5000",
+            )
+            if option
+        )
+
+        min_size = max(1, int(os.getenv("DATABASE_POOL_MIN_SIZE", "1")))
+        max_size = max(min_size, int(os.getenv("DATABASE_POOL_MAX_SIZE", "4")))
+        pool = ConnectionPool(
+            conninfo="",
+            kwargs=connection_info,
+            min_size=min_size,
+            max_size=max_size,
+            timeout=float(os.getenv("DATABASE_POOL_TIMEOUT", "8")),
+            open=False,
+        )
+        try:
+            pool.open(wait=True, timeout=10)
+        except Exception:
+            pool.close()
+            raise
+
+        _postgres_pool = pool
+        _postgres_pool_url = database_url
+        return pool
+
+
+def close_database_pool() -> None:
+    global _postgres_pool, _postgres_pool_url
+
+    with _postgres_pool_lock:
+        if _postgres_pool is not None:
+            _postgres_pool.close()
+            _postgres_pool = None
+            _postgres_pool_url = ""

@@ -26,5 +26,4 @@ ENV PATH="/opt/venv/bin:${PATH}" \
     PORT=3000
 
 EXPOSE 3000
-VOLUME ["/app/data"]
 CMD ["bash", "docker/start.sh"]

@@ -42,7 +42,7 @@ The overview numbers are calculated from the configured CRM database: **Contacts
 
 ## Deploy with Docker
 
-The production image runs Next.js on port `$PORT` and FastAPI only on `127.0.0.1:8001` inside the same container. The browser never calls FastAPI directly. Without `DATABASE_URL`, SQLite is stored at `/app/data/phigrad-crm.sqlite3`.
+The production image runs Next.js and FastAPI in one container. Next.js listens on the platform-provided `$PORT`; FastAPI listens only on `127.0.0.1:8001`, and the server-side bridge uses that local address by default. The browser never calls FastAPI directly. The FastAPI readiness check verifies the configured database as well as the process. Without `DATABASE_URL`, SQLite is stored at `/app/data/phigrad-crm.sqlite3`.
 
 ```powershell
 docker build -t phigrad .
@@ -59,6 +59,24 @@ Do not commit `.env`. For a new empty database, set `SUPERADMIN_EMAIL` and `SUPE
 4. The first empty Supabase database bootstraps `SUPERADMIN_EMAIL` using `SUPERADMIN_INITIAL_PASSWORD`. Sign in, then remove the initial password from Render.
 
 Supabase starts with a new, empty database; existing SQLite records are not copied automatically. Local development still uses SQLite unless `DATABASE_URL` is set. The Render Blueprint no longer needs a persistent disk when `DATABASE_URL` points to Supabase. Lovable is a hosted app builder and is not the runtime for this Next.js and FastAPI image.
+
+### Deploy with Railway and Supabase
+
+1. Deploy the GitHub branch selected in the Railway service. Railway detects the root `Dockerfile` automatically.
+2. Add these Railway variables:
+   - `DATABASE_URL`: the Supabase Session Pooler connection string (port `5432`).
+   - `LOCAL_API_TOKEN`: a long random secret shared by Next.js and FastAPI inside the container.
+   - `APP_URL`: the public HTTPS origin, for example `https://<service>.up.railway.app`.
+   - `PHIGRAD_ENV=production`.
+   - `SUPERADMIN_EMAIL`; set `SUPERADMIN_INITIAL_PASSWORD` only while bootstrapping an empty database, then remove it after first sign-in.
+   - `UNIPILE_API_KEY` for Gmail/LinkedIn. `UNIPILE_API_BASE_URL` defaults to `https://api.unipile.com`.
+   - `OPENROUTER_API_KEY` for AI features. `OPENROUTER_MODEL` defaults to `openai/gpt-4o-mini`.
+   - For invitation email delivery, configure `SMTP_HOST`, `SMTP_USERNAME`, and `SMTP_PASSWORD`; `SMTP_PORT` defaults to `587`, `SMTP_USE_TLS` defaults to `true`, and `SMTP_FROM` is optional.
+   - `FASTAPI_BASE_URL` normally needs no override; the image defaults to `http://127.0.0.1:8001`. Do not point it at the public Railway domain or another service while using this single-container setup.
+   - `DATABASE_POOL_MIN_SIZE` and `DATABASE_POOL_MAX_SIZE` are optional tuning settings; defaults are `1` and `4`. `DATABASE_POOL_TIMEOUT` defaults to `8` seconds.
+3. Set the service health check path to `/api/health`. It now checks FastAPI and performs a lightweight database query. On first startup, the app initializes its tables in Supabase.
+
+This branch omits Docker's `VOLUME` instruction because Railway manages persistent storage through service volumes. With Supabase configured, the app does not need a Railway volume. If you choose SQLite instead, attach a Railway volume mounted at `/app/data`; without it, SQLite data is ephemeral.
 
 ## Important boundaries
 
